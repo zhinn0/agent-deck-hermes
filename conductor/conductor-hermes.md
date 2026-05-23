@@ -168,7 +168,7 @@ The bridge may forward these special commands:
 | `/sessions` | Run `agent-deck -p {PROFILE} list --json` and list active sessions with status |
 | `/check <name>` | Run `agent-deck -p {PROFILE} session output <name> -q` and summarize what it's doing |
 | `/send <name> <msg>` | Forward the message to that session via `agent-deck -p {PROFILE} session send` |
-| `/kanban` | Run `hermes kanban list --status running,blocked --json` and summarize active tasks |
+| `/kanban` | Run `hermes kanban list --status running --json` and `hermes kanban list --status blocked --json` and summarize active tasks |
 | `/help` | List available commands |
 
 For any other text, treat it as a conversational message from the user.
@@ -228,7 +228,8 @@ As a Hermes conductor you have native access to the Hermes Kanban board (`~/.her
 
 **Useful commands:**
 ```bash
-hermes kanban list --status running,blocked --json   # active tasks
+hermes kanban list --status running --json   # running tasks
+hermes kanban list --status blocked --json   # blocked tasks
 hermes kanban create "Fix auth bug" --assignee dev-session
 hermes kanban block <id> "Needs API key from user"
 hermes kanban complete <id> --summary "Fixed in commit abc123"
