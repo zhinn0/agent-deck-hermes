@@ -315,6 +315,9 @@ type Home struct {
 	hookWatcher        *session.StatusFileWatcher
 	pendingHooksPrompt bool // True if user should be prompted to install hooks
 
+	// Hermes Kanban badge watcher (WebSocket real-time counts)
+	kanbanWatcher *session.KanbanWatcher
+
 	// Context-% based /clear for conductor sessions with clear_on_compact
 	clearOnCompactSent map[string]time.Time // instanceID -> last /clear send time (debounce)
 
@@ -722,6 +725,10 @@ type attachReturnRefreshMsg struct{}
 
 // storageChangedMsg signals that state.db was modified externally
 type storageChangedMsg struct{}
+
+// kanbanCountsChangedMsg is sent by the Hermes KanbanWatcher when running or
+// blocked task counts change. Triggers a lightweight TUI re-render.
+type kanbanCountsChangedMsg struct{}
 
 // openCodeDetectionCompleteMsg signals that OpenCode session detection finished
 // Used to trigger a save after async detection completes
@@ -1181,6 +1188,12 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 				}
 			}
 		}
+	}
+
+	// Start Hermes Kanban badge watcher if a gateway URL is configured
+	if gatewayURL := session.GetHermesGatewayURL(); gatewayURL != "" {
+		w := session.StartKanbanWatcher(gatewayURL)
+		h.kanbanWatcher = w
 	}
 
 	// Start system theme watcher if configured
@@ -2029,6 +2042,11 @@ func (h *Home) Init() tea.Cmd {
 		cmds = append(cmds, listenForThemeChange(h.themeWatcher))
 	}
 
+	// Start listening for Hermes Kanban badge updates
+	if h.kanbanWatcher != nil {
+		cmds = append(cmds, listenForKanbanUpdates(h.kanbanWatcher))
+	}
+
 	// Start watcher engine (D-07: lifecycle tied to TUI startup)
 	cmds = append(cmds, h.startWatcherEngine())
 
@@ -2066,6 +2084,23 @@ func listenForThemeChange(tw *ThemeWatcher) tea.Cmd {
 			return nil
 		}
 		return systemThemeMsg{dark: isDark}
+	}
+}
+
+// listenForKanbanUpdates blocks until the KanbanWatcher notifies a count change,
+// then returns a kanbanCountsChangedMsg. Must be re-issued in the Update handler
+// after each message to keep listening (Bubble Tea cmd pattern).
+func listenForKanbanUpdates(kw *session.KanbanWatcher) tea.Cmd {
+	if kw == nil {
+		return nil
+	}
+	ch := kw.Subscribe()
+	return func() tea.Msg {
+		_, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return kanbanCountsChangedMsg{}
 	}
 }
 
@@ -4559,6 +4594,13 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			// Force save to persist the model change
 			h.forceSaveInstances()
+		}
+		return h, nil
+
+	case kanbanCountsChangedMsg:
+		// Kanban counts changed — re-render badge and re-register listener.
+		if h.kanbanWatcher != nil {
+			return h, listenForKanbanUpdates(h.kanbanWatcher)
 		}
 		return h, nil
 
@@ -7652,6 +7694,10 @@ func (h *Home) performFinalShutdown(shutdownPool bool) tea.Cmd {
 		// Close hook watcher (Claude Code lifecycle hooks)
 		if h.hookWatcher != nil {
 			h.hookWatcher.Stop()
+		}
+		// Stop Hermes Kanban badge watcher
+		if h.kanbanWatcher != nil {
+			h.kanbanWatcher.Stop()
 		}
 		// Close storage watcher
 		if h.storageWatcher != nil {
