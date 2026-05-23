@@ -37,6 +37,7 @@ type kanbanBoardResponse struct {
 }
 
 type kanbanTask struct {
+	ID     string `json:"id"`
 	Status string `json:"status"`
 }
 
@@ -46,9 +47,11 @@ type kanbanTask struct {
 type KanbanWatcher struct {
 	gatewayURL string
 
-	mu      sync.RWMutex
-	running int
-	blocked int
+	mu           sync.RWMutex
+	running      int
+	blocked      int
+	taskStatuses map[string]string
+	seedOK       bool // true after at least one successful seedCounts
 
 	lastEventID int64
 
@@ -63,8 +66,9 @@ type KanbanWatcher struct {
 // (e.g. "http://127.0.0.1:8080" or "ws://127.0.0.1:8080").
 func NewKanbanWatcher(gatewayURL string) *KanbanWatcher {
 	return &KanbanWatcher{
-		gatewayURL: gatewayURL,
-		stopCh:     make(chan struct{}),
+		gatewayURL:   gatewayURL,
+		taskStatuses: make(map[string]string),
+		stopCh:       make(chan struct{}),
 	}
 }
 
@@ -86,6 +90,28 @@ func (w *KanbanWatcher) Counts() (running, blocked int) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	return w.running, w.blocked
+}
+
+// TaskStatus returns the current status of a specific task by ID.
+// Returns "running", "blocked", or "" (not found / terminal state).
+func (w *KanbanWatcher) TaskStatus(id string) string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.taskStatuses == nil {
+		return ""
+	}
+	return w.taskStatuses[id]
+}
+
+// IsHealthy returns true if the watcher has successfully seeded from the gateway
+// at least once. When false, callers should fall back to CLI polling.
+func (w *KanbanWatcher) IsHealthy() bool {
+	if w == nil {
+		return false
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.seedOK
 }
 
 // Subscribe returns a channel that receives an empty struct whenever the
@@ -117,6 +143,19 @@ func (w *KanbanWatcher) setCountsAndNotify(running, blocked int) {
 	changed := w.running != running || w.blocked != blocked
 	w.running = running
 	w.blocked = blocked
+	w.mu.Unlock()
+	if changed {
+		w.notify()
+	}
+}
+
+// setCountsAndStatusesAndNotify updates counts and the per-task status map atomically.
+func (w *KanbanWatcher) setCountsAndStatusesAndNotify(running, blocked int, statuses map[string]string) {
+	w.mu.Lock()
+	changed := w.running != running || w.blocked != blocked
+	w.running = running
+	w.blocked = blocked
+	w.taskStatuses = statuses
 	w.mu.Unlock()
 	if changed {
 		w.notify()
@@ -168,12 +207,16 @@ func (w *KanbanWatcher) runSession() error {
 		}
 	}()
 
-	// Seed initial counts via HTTP board endpoint
-	running, blocked, err := w.seedCounts(ctx)
+	// Seed initial counts and per-task statuses via HTTP board endpoint.
+	// Clear stale task statuses from any previous connection before applying fresh seed.
+	running, blocked, statuses, err := w.seedCounts(ctx)
 	if err != nil {
 		return fmt.Errorf("seed counts: %w", err)
 	}
-	w.setCountsAndNotify(running, blocked)
+	w.mu.Lock()
+	w.seedOK = true
+	w.mu.Unlock()
+	w.setCountsAndStatusesAndNotify(running, blocked, statuses)
 
 	// Build WebSocket URL
 	wsURL := w.buildWSURL()
@@ -211,45 +254,53 @@ func (w *KanbanWatcher) runSession() error {
 	}
 }
 
-// seedCounts fetches the current board state via HTTP and returns running/blocked counts.
-func (w *KanbanWatcher) seedCounts(ctx context.Context) (running, blocked int, err error) {
+// seedCounts fetches the current board state via HTTP and returns running/blocked
+// counts along with a per-task status map.
+func (w *KanbanWatcher) seedCounts(ctx context.Context) (running, blocked int, statuses map[string]string, err error) {
 	boardURL := w.buildHTTPURL() + "/api/plugins/kanban/board?include_archived=false"
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, boardURL, nil)
 	if err != nil {
-		return 0, 0, fmt.Errorf("build request: %w", err)
+		return 0, 0, nil, fmt.Errorf("build request: %w", err)
 	}
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, 0, fmt.Errorf("http get board: %w", err)
+		return 0, 0, nil, fmt.Errorf("http get board: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, 0, fmt.Errorf("board endpoint returned %d", resp.StatusCode)
+		return 0, 0, nil, fmt.Errorf("board endpoint returned %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MB cap
 	if err != nil {
-		return 0, 0, fmt.Errorf("read body: %w", err)
+		return 0, 0, nil, fmt.Errorf("read body: %w", err)
 	}
 
 	var board kanbanBoardResponse
 	if err := json.Unmarshal(body, &board); err != nil {
-		return 0, 0, fmt.Errorf("unmarshal board: %w", err)
+		return 0, 0, nil, fmt.Errorf("unmarshal board: %w", err)
 	}
 
+	statuses = make(map[string]string)
 	for _, t := range board.Tasks {
 		switch t.Status {
 		case "running", "claimed":
 			running++
+			if t.ID != "" {
+				statuses[t.ID] = "running"
+			}
 		case "blocked":
 			blocked++
+			if t.ID != "" {
+				statuses[t.ID] = "blocked"
+			}
 		}
 	}
-	return running, blocked, nil
+	return running, blocked, statuses, nil
 }
 
 // readEvents reads WebSocket messages and updates counts.
@@ -273,7 +324,7 @@ func (w *KanbanWatcher) readEvents(conn *websocket.Conn) error {
 	}
 }
 
-// applyEvent updates in-memory counts based on the event kind.
+// applyEvent updates in-memory counts and per-task status based on the event kind.
 func (w *KanbanWatcher) applyEvent(evt kanbanEvent) {
 	w.mu.Lock()
 	running := w.running
@@ -282,19 +333,34 @@ func (w *KanbanWatcher) applyEvent(evt kanbanEvent) {
 	switch evt.Kind {
 	case "claimed":
 		running++
+		if evt.TaskID != "" {
+			w.taskStatuses[evt.TaskID] = "running"
+		}
 	case "completed", "archived":
 		if running > 0 {
 			running--
 		}
+		if evt.TaskID != "" {
+			delete(w.taskStatuses, evt.TaskID)
+		}
 	case "blocked":
 		blocked++
+		if evt.TaskID != "" {
+			w.taskStatuses[evt.TaskID] = "blocked"
+		}
 	case "unblocked":
 		if blocked > 0 {
 			blocked--
 		}
+		if evt.TaskID != "" {
+			w.taskStatuses[evt.TaskID] = "running"
+		}
 	case "reclaimed", "crashed", "timed_out":
 		if running > 0 {
 			running--
+		}
+		if evt.TaskID != "" {
+			delete(w.taskStatuses, evt.TaskID)
 		}
 	}
 

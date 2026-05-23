@@ -730,8 +730,32 @@ type attachReturnRefreshMsg struct{}
 type storageChangedMsg struct{}
 
 // kanbanCountsChangedMsg is sent by the Hermes KanbanWatcher when running or
-// blocked task counts change. Triggers a lightweight TUI re-render.
+// blocked task counts change, or when the CLI poll ticker fires. Triggers re-render.
 type kanbanCountsChangedMsg struct{}
+
+// kanbanPollInterval is how often agent-deck re-polls kanban CLI when the
+// WebSocket watcher is unavailable or unhealthy.
+const kanbanPollInterval = 15 * time.Second
+
+// kanbanPollCmd returns a one-shot Cmd that waits kanbanPollInterval, then
+// synchronously refreshes the CLI cache and returns kanbanCountsChangedMsg.
+// Must be re-issued from the Update handler on each firing to keep ticking.
+func kanbanPollCmd() tea.Cmd {
+	return tea.Tick(kanbanPollInterval, func(time.Time) tea.Msg {
+		session.ForceRefreshHermesKanbanCache()
+		return kanbanCountsChangedMsg{}
+	})
+}
+
+// kanbanImmediateRefreshCmd does a one-shot synchronous CLI cache refresh and
+// returns kanbanCountsChangedMsg immediately. Used at startup so badges appear
+// without waiting for the first tick interval.
+func kanbanImmediateRefreshCmd() tea.Cmd {
+	return func() tea.Msg {
+		session.ForceRefreshHermesKanbanCache()
+		return kanbanCountsChangedMsg{}
+	}
+}
 
 // openCodeDetectionCompleteMsg signals that OpenCode session detection finished
 // Used to trigger a save after async detection completes
@@ -2048,10 +2072,14 @@ func (h *Home) Init() tea.Cmd {
 		cmds = append(cmds, listenForThemeChange(h.themeWatcher))
 	}
 
-	// Start listening for Hermes Kanban badge updates
+	// Start listening for Hermes Kanban badge updates.
+	// Also start a CLI poll ticker so badges render even when the WebSocket
+	// watcher is unavailable (e.g. gateway running without kanban WS endpoints).
 	if h.kanbanWatcher != nil {
 		cmds = append(cmds, listenForKanbanUpdates(h.kanbanWatcher))
 	}
+	// Immediate refresh so badges appear on first render, then periodic ticks.
+	cmds = append(cmds, kanbanImmediateRefreshCmd(), kanbanPollCmd())
 
 	// Start watcher engine (D-07: lifecycle tied to TUI startup)
 	cmds = append(cmds, h.startWatcherEngine())
@@ -4605,11 +4633,13 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case kanbanCountsChangedMsg:
-		// Kanban counts changed — re-render badge and re-register listener.
+		// Kanban counts changed — re-render badge and re-register listeners.
+		var cmds []tea.Cmd
 		if h.kanbanWatcher != nil {
-			return h, listenForKanbanUpdates(h.kanbanWatcher)
+			cmds = append(cmds, listenForKanbanUpdates(h.kanbanWatcher))
 		}
-		return h, nil
+		cmds = append(cmds, kanbanPollCmd())
+		return h, tea.Batch(cmds...)
 
 	case kanbanFetchDoneMsg:
 		if h.kanbanPanel != nil {
@@ -5316,6 +5346,20 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "r":
 				h.kanbanPanel.Show()
 				return h, fetchKanbanTasksCmd()
+			case "up", "k":
+				h.kanbanPanel.MoveUp()
+				return h, nil
+			case "down", "j":
+				h.kanbanPanel.MoveDown()
+				return h, nil
+			case "left", "right", "tab":
+				h.kanbanPanel.SwitchColumn()
+				return h, nil
+			case "enter":
+				if task := h.kanbanPanel.SelectedTask(); task != nil {
+					h.jumpToKanbanSession(task.ID)
+				}
+				return h, nil
 			}
 		}
 
@@ -11037,35 +11081,23 @@ func (h *Home) renderSingleColumnLayout(totalHeight int) string {
 
 // renderSectionDivider creates a modern section divider with optional centered label
 // Format: ─────────── Label ─────────── (lines extend to fill width)
-// renderHermesKanbanBadge returns a styled [K:...] badge string.
-// When selected, the entire badge uses SessionStatusSelStyle.
-// When not selected: running count is dim, blocked count+! is red.
-func renderHermesKanbanBadge(running, blocked int, selected bool) string {
-	dimStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
-	if selected {
-		dimStyle = SessionStatusSelStyle
-	}
-	if running == 0 && blocked == 0 {
-		return dimStyle.Render(" [K]")
-	}
-	if selected {
-		switch {
-		case blocked == 0:
-			return dimStyle.Render(fmt.Sprintf(" [K:%d]", running))
-		case running == 0:
-			return dimStyle.Render(fmt.Sprintf(" [K:%d!]", blocked))
-		default:
-			return dimStyle.Render(fmt.Sprintf(" [K:%d+%d!]", running, blocked))
+// renderHermesKanbanBadge returns a styled [K:●] or [K:▲] badge for a session
+// with a linked kanban task. Shows green ● for running/claimed, red ▲ for blocked.
+// Returns "" when the task is not active (ready, completed, etc.).
+func renderHermesKanbanBadge(taskStatus string, selected bool) string {
+	switch taskStatus {
+	case "running":
+		if selected {
+			return SessionStatusSelStyle.Render(" [K:●]")
 		}
-	}
-	redStyle := lipgloss.NewStyle().Foreground(ColorRed)
-	switch {
-	case blocked == 0:
-		return dimStyle.Render(fmt.Sprintf(" [K:%d]", running))
-	case running == 0:
-		return dimStyle.Render(" [K:") + redStyle.Render(fmt.Sprintf("%d!", blocked)) + dimStyle.Render("]")
+		return lipgloss.NewStyle().Foreground(ColorGreen).Render(" [K:●]")
+	case "blocked":
+		if selected {
+			return SessionStatusSelStyle.Render(" [K:▲]")
+		}
+		return lipgloss.NewStyle().Foreground(ColorRed).Render(" [K:▲]")
 	default:
-		return dimStyle.Render(fmt.Sprintf(" [K:%d+", running)) + redStyle.Render(fmt.Sprintf("%d!", blocked)) + dimStyle.Render("]")
+		return ""
 	}
 }
 
@@ -12390,17 +12422,12 @@ func (h *Home) renderSessionItem(
 		sandboxBadge = sbStyle.Render(" [sandbox]")
 	}
 
-	// Kanban badge for Hermes sessions. Hermes Kanban is SQLite-backed at
-	// ~/.hermes/kanban.db. When the DB exists, query live running/blocked counts
-	// via GetHermesKanbanCounts (stale-while-revalidate, never blocks render).
-	// Format: [K:3] dim | [K:3+2!] with blocked portion in red | [K:2!] red only.
+	// Kanban badge: shown only when this session is linked to an active kanban task.
+	// [K:●] green = running/claimed, [K:▲] red = blocked, nothing = task inactive/unlinked.
 	kanbanBadge := ""
-	if inst.Tool == "hermes" {
-		kanbanDB := filepath.Join(session.GetHermesConfigDir(), "kanban.db")
-		if _, err := os.Stat(kanbanDB); err == nil {
-			running, blocked := session.GetHermesKanbanCounts()
-			kanbanBadge = renderHermesKanbanBadge(running, blocked, selected)
-		}
+	if inst.KanbanTaskID != "" {
+		taskStatus := session.GetHermesKanbanTaskStatus(inst.KanbanTaskID)
+		kanbanBadge = renderHermesKanbanBadge(taskStatus, selected)
 	}
 
 	// Multi-repo badge for multi-repo sessions.
@@ -14877,6 +14904,20 @@ func (h *Home) finishWorktree(inst *session.Instance, sessionID, sessionTitle, b
 }
 
 // getOtherActiveSessions returns sessions excluding the given ID and error/stopped-status sessions.
+// jumpToKanbanSession finds the session linked to the given kanban task ID,
+// moves the list cursor to it, and hides the kanban panel.
+// If no session is linked, the panel stays open with no change.
+func (h *Home) jumpToKanbanSession(taskID string) {
+	for i, item := range h.flatItems {
+		if item.Session != nil && item.Session.KanbanTaskID == taskID {
+			h.cursor = i
+			h.kanbanPanel.Hide()
+			return
+		}
+	}
+	h.kanbanPanel.SetNotice("no linked session — use 'agent-deck kanban attach'")
+}
+
 func (h *Home) getOtherActiveSessions(excludeID string) []*session.Instance {
 	var result []*session.Instance
 	for _, inst := range h.instances {

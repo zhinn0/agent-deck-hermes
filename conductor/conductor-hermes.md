@@ -226,15 +226,26 @@ Health check: `agent-deck` monitors `IsHermesGatewayReachable()` and will warn i
 
 As a Hermes conductor you have native access to the Hermes Kanban board (`~/.hermes/kanban.db`). Use it to track multi-session work items that need durable state across restarts.
 
+**Task lifecycle:** `ready` → `claimed` → (`blocked` ↔ `unblocked`) → `completed`. Failure exits: `crashed`, `timed_out`, `reclaimed`.
+
 **Useful commands:**
 ```bash
-hermes kanban list --status running --json   # running tasks
-hermes kanban list --status blocked --json   # blocked tasks
+hermes kanban list --json                       # all tasks across all boards
+hermes kanban list --status running --json      # running tasks only (one --status at a time)
+hermes kanban list --status blocked --json      # blocked tasks only
 hermes kanban create "Fix auth bug" --assignee dev-session
 hermes kanban block <id> "Needs API key from user"
 hermes kanban complete <id> --summary "Fixed in commit abc123"
-hermes kanban watch --kinds blocked,completed        # live event stream
+hermes kanban watch --kinds blocked,completed   # live event stream
 ```
+
+**Note:** `hermes kanban list --status` only accepts one value at a time. To filter multiple statuses, run separate calls and combine.
+
+**Agent-deck integration:**
+- Link a session to a task: `agent-deck kanban attach <session> <task-id>` or `agent-deck kanban create "..." --session <id>`
+- Linked sessions get `HERMES_KANBAN_TASK=<id>` injected and claim the task on startup
+- In the agent-deck TUI: press `B` to open the Kanban panel (RUNNING | BLOCKED columns, navigable with ↑↓/←→, Enter jumps to the linked session)
+- Session rows show `[K:●]` (green, running) or `[K:▲]` (red, blocked) when linked to an active task
 
 **When to use Kanban:**
 - A session is working on something that might need to survive a restart

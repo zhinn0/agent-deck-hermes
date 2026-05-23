@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -170,14 +171,61 @@ func StartKanbanWatcher(gatewayURL string) *KanbanWatcher {
 	return w
 }
 
-// GetHermesGatewayURL returns the configured Hermes gateway URL from user config,
-// or an empty string if not set.
-func GetHermesGatewayURL() string {
-	config, err := LoadUserConfig()
-	if err != nil || config == nil {
+// hermesDefaultGatewayPort is the port hermes gateway always listens on.
+// See gateway/platforms/api_server.py: DEFAULT_PORT = 8642.
+const hermesDefaultGatewayPort = 8642
+
+// hermesGatewayStateFile is the JSON file hermes writes while its gateway is running.
+const hermesGatewayStateFile = "gateway_state.json"
+
+// hermesGatewayState is a minimal subset of gateway_state.json.
+type hermesGatewayState struct {
+	GatewayState string `json:"gateway_state"`
+}
+
+// isHermesGatewayRunning checks ~/.hermes/gateway_state.json to see if
+// the hermes gateway process believes it is running. This is a lightweight
+// signal that avoids a network round-trip; callers should still probe the
+// URL before trusting the result.
+func isHermesGatewayRunning() bool {
+	p := filepath.Join(GetHermesConfigDir(), hermesGatewayStateFile)
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return false
+	}
+	var state hermesGatewayState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return false
+	}
+	return state.GatewayState == "running"
+}
+
+// DiscoverHermesGatewayURL auto-detects the hermes gateway URL.
+// It checks gateway_state.json first (cheap), then probes the well-known
+// local address. Returns "" if the gateway does not appear to be reachable.
+func DiscoverHermesGatewayURL() string {
+	if !isHermesGatewayRunning() {
 		return ""
 	}
-	return strings.TrimSpace(config.Hermes.GatewayURL)
+	candidate := fmt.Sprintf("http://127.0.0.1:%d", hermesDefaultGatewayPort)
+	if IsHermesGatewayReachable(candidate) {
+		return candidate
+	}
+	return ""
+}
+
+// GetHermesGatewayURL returns the hermes gateway URL. It first checks the
+// explicit gateway_url in agent-deck's config; if unset, it attempts
+// auto-discovery via DiscoverHermesGatewayURL so users who run the hermes
+// gateway get real-time kanban updates without any manual configuration.
+func GetHermesGatewayURL() string {
+	config, err := LoadUserConfig()
+	if err == nil && config != nil {
+		if url := strings.TrimSpace(config.Hermes.GatewayURL); url != "" {
+			return url
+		}
+	}
+	return DiscoverHermesGatewayURL()
 }
 
 // kanbanCache holds the last-fetched Kanban task counts with stale-while-revalidate
@@ -185,24 +233,25 @@ func GetHermesGatewayURL() string {
 // refreshes when the cache is older than kanbanCacheTTL.
 // Used as fallback when no gateway URL is configured.
 var kanbanCache struct {
-	mu         sync.Mutex
-	running    int
-	blocked    int
-	fetchedAt  time.Time
-	refreshing bool
+	mu           sync.Mutex
+	running      int
+	blocked      int
+	taskStatuses map[string]string
+	fetchedAt    time.Time
+	refreshing   bool
 }
 
 const kanbanCacheTTL = 15 * time.Second
 
 // GetHermesKanbanCounts returns the current running and blocked task counts.
-// Prefers the WebSocket KanbanWatcher (real-time) when available; falls back
-// to stale-while-revalidate CLI polling when no gateway is configured.
+// Prefers the WebSocket KanbanWatcher (real-time) when available and healthy;
+// falls back to stale-while-revalidate CLI polling otherwise.
 // Returns (0, 0) if hermes is not in PATH or the CLI call fails.
 func GetHermesKanbanCounts() (running, blocked int) {
 	kanbanWatcherMu.Lock()
 	w := globalKanbanWatcher
 	kanbanWatcherMu.Unlock()
-	if w != nil {
+	if w != nil && w.IsHealthy() {
 		return w.Counts()
 	}
 
@@ -237,23 +286,73 @@ func refreshHermesKanbanCache() {
 		return
 	}
 	var tasks []struct {
+		ID     string `json:"id"`
 		Status string `json:"status"`
 	}
 	if err := json.Unmarshal(out, &tasks); err != nil {
 		return
 	}
 	var r, b int
+	statuses := make(map[string]string)
 	for _, t := range tasks {
 		switch t.Status {
-		case "running":
+		case "running", "claimed":
 			r++
+			if t.ID != "" {
+				statuses[t.ID] = "running"
+			}
 		case "blocked":
 			b++
+			if t.ID != "" {
+				statuses[t.ID] = "blocked"
+			}
 		}
 	}
 	kanbanCache.mu.Lock()
 	kanbanCache.running = r
 	kanbanCache.blocked = b
+	kanbanCache.taskStatuses = statuses
 	kanbanCache.fetchedAt = time.Now()
 	kanbanCache.mu.Unlock()
+}
+
+// ForceRefreshHermesKanbanCache refreshes the CLI-based kanban cache immediately,
+// ignoring the TTL. Safe to call from a Bubble Tea Cmd goroutine.
+func ForceRefreshHermesKanbanCache() {
+	refreshHermesKanbanCache()
+}
+
+// GetHermesKanbanTaskStatus returns the current kanban status for a specific task ID.
+// Returns "running", "blocked", or "" (task not active / not found).
+// Prefers the WebSocket KanbanWatcher when healthy; falls back to the
+// stale-while-revalidate CLI cache otherwise (including when the watcher is
+// running but the kanban WebSocket endpoint is unavailable in this gateway version).
+func GetHermesKanbanTaskStatus(taskID string) string {
+	if taskID == "" {
+		return ""
+	}
+	kanbanWatcherMu.Lock()
+	w := globalKanbanWatcher
+	kanbanWatcherMu.Unlock()
+	if w != nil && w.IsHealthy() {
+		return w.TaskStatus(taskID)
+	}
+	kanbanCache.mu.Lock()
+	defer kanbanCache.mu.Unlock()
+	// Kick off a background refresh if the cache is stale — same pattern as
+	// GetHermesKanbanCounts. Without this the per-task badge never populates
+	// when GetHermesKanbanCounts isn't called elsewhere.
+	if time.Since(kanbanCache.fetchedAt) >= kanbanCacheTTL && !kanbanCache.refreshing {
+		kanbanCache.refreshing = true
+		go func() {
+			refreshHermesKanbanCache()
+			kanbanCache.mu.Lock()
+			kanbanCache.refreshing = false
+			kanbanCache.mu.Unlock()
+		}()
+	}
+	if kanbanCache.taskStatuses == nil {
+		return ""
+	}
+	return kanbanCache.taskStatuses[taskID]
 }

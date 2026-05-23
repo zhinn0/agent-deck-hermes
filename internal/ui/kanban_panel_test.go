@@ -17,11 +17,17 @@ func TestKanbanPanel_NilSafe(t *testing.T) {
 	p.Hide()
 	p.SetSize(120, 40)
 	p.SetTasks(nil, "")
+	p.MoveUp()
+	p.MoveDown()
+	p.SwitchColumn()
 	if p.Toggle() {
 		t.Error("nil panel toggle should return false")
 	}
 	if p.View() != "" {
 		t.Error("nil panel View should return empty string")
+	}
+	if p.SelectedTask() != nil {
+		t.Error("nil panel SelectedTask should return nil")
 	}
 }
 
@@ -197,5 +203,149 @@ func TestIsHermesNotFound(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("isHermesNotFound(%q) = %v, want %v", tt.msg, got, tt.want)
 		}
+	}
+}
+
+// TestKanbanPanel_MoveDown_Clamps verifies MoveDown does not exceed the last row.
+func TestKanbanPanel_MoveDown_Clamps(t *testing.T) {
+	p := NewKanbanPanel()
+	p.SetTasks([]KanbanTask{
+		{ID: "T1", Title: "Task 1", Status: "running"},
+		{ID: "T2", Title: "Task 2", Status: "running"},
+	}, "")
+	for i := 0; i < 5; i++ {
+		p.MoveDown()
+	}
+	if p.selectedRow != 1 {
+		t.Errorf("selectedRow = %d after clamped MoveDown, want 1", p.selectedRow)
+	}
+}
+
+// TestKanbanPanel_MoveUp_Clamps verifies MoveUp does not go below row 0.
+func TestKanbanPanel_MoveUp_Clamps(t *testing.T) {
+	p := NewKanbanPanel()
+	p.SetTasks([]KanbanTask{
+		{ID: "T1", Title: "Task 1", Status: "running"},
+	}, "")
+	p.MoveUp()
+	if p.selectedRow != 0 {
+		t.Errorf("selectedRow = %d after MoveUp at row 0, want 0", p.selectedRow)
+	}
+}
+
+// TestKanbanPanel_SwitchColumn verifies SwitchColumn toggles between 0 and 1.
+func TestKanbanPanel_SwitchColumn(t *testing.T) {
+	p := NewKanbanPanel()
+	p.SetTasks([]KanbanTask{
+		{ID: "T1", Title: "Running", Status: "running"},
+		{ID: "T2", Title: "Blocked", Status: "blocked"},
+	}, "")
+	if p.selectedCol != 0 {
+		t.Fatalf("initial selectedCol = %d, want 0", p.selectedCol)
+	}
+	p.SwitchColumn()
+	if p.selectedCol != 1 {
+		t.Errorf("after SwitchColumn selectedCol = %d, want 1", p.selectedCol)
+	}
+	p.SwitchColumn()
+	if p.selectedCol != 0 {
+		t.Errorf("after second SwitchColumn selectedCol = %d, want 0", p.selectedCol)
+	}
+}
+
+// TestKanbanPanel_SwitchColumn_EmptyTarget verifies switching to an empty column
+// keeps selectedRow=0 and SelectedTask returns nil.
+func TestKanbanPanel_SwitchColumn_EmptyTarget(t *testing.T) {
+	p := NewKanbanPanel()
+	p.SetTasks([]KanbanTask{
+		{ID: "T1", Title: "Running", Status: "running"},
+	}, "")
+	if p.selectedCol != 0 {
+		t.Fatalf("initial selectedCol = %d, want 0", p.selectedCol)
+	}
+	p.SwitchColumn()
+	if p.selectedCol != 1 {
+		t.Errorf("selectedCol = %d, want 1", p.selectedCol)
+	}
+	if p.selectedRow != 0 {
+		t.Errorf("selectedRow = %d, want 0", p.selectedRow)
+	}
+	if p.SelectedTask() != nil {
+		t.Error("SelectedTask() should be nil for empty blocked column")
+	}
+}
+
+// TestKanbanPanel_SelectedTask verifies the correct task is returned.
+func TestKanbanPanel_SelectedTask(t *testing.T) {
+	p := NewKanbanPanel()
+	p.SetTasks([]KanbanTask{
+		{ID: "R1", Title: "Running 1", Status: "running"},
+		{ID: "R2", Title: "Running 2", Status: "running"},
+		{ID: "B1", Title: "Blocked 1", Status: "blocked"},
+	}, "")
+	p.selectedCol = 0
+	p.selectedRow = 1
+	task := p.SelectedTask()
+	if task == nil {
+		t.Fatal("SelectedTask() returned nil, want second running task")
+	}
+	if task.ID != "R2" {
+		t.Errorf("SelectedTask().ID = %q, want %q", task.ID, "R2")
+	}
+}
+
+// TestKanbanPanel_SetTasks_ClampsRow verifies selectedRow is clamped after SetTasks.
+func TestKanbanPanel_SetTasks_ClampsRow(t *testing.T) {
+	p := NewKanbanPanel()
+	p.selectedRow = 5
+	p.SetTasks([]KanbanTask{
+		{ID: "T1", Title: "Task 1", Status: "running"},
+		{ID: "T2", Title: "Task 2", Status: "running"},
+	}, "")
+	if p.selectedRow != 1 {
+		t.Errorf("selectedRow = %d after SetTasks clamp, want 1", p.selectedRow)
+	}
+}
+
+// TestKanbanPanel_SetTasks_SwitchesColIfEmpty verifies that when the current
+// column becomes empty and the other has tasks, selectedCol switches.
+func TestKanbanPanel_SetTasks_SwitchesColIfEmpty(t *testing.T) {
+	p := NewKanbanPanel()
+	p.selectedCol = 1 // start on blocked column
+	p.SetTasks([]KanbanTask{
+		{ID: "T1", Title: "Running 1", Status: "running"},
+		{ID: "T2", Title: "Running 2", Status: "running"},
+	}, "")
+	if p.selectedCol != 0 {
+		t.Errorf("selectedCol = %d, want 0 (switched from empty blocked to running)", p.selectedCol)
+	}
+}
+
+// TestKanbanPanel_SelectedTask_NilWhenEmpty verifies SelectedTask returns nil for
+// an empty panel and also for a nil receiver.
+func TestKanbanPanel_SelectedTask_NilWhenEmpty(t *testing.T) {
+	p := NewKanbanPanel()
+	if p.SelectedTask() != nil {
+		t.Error("SelectedTask() should be nil when no tasks")
+	}
+	var nilP *KanbanPanel
+	if nilP.SelectedTask() != nil {
+		t.Error("SelectedTask() on nil receiver should return nil")
+	}
+}
+
+// TestKanbanPanel_ViewHighlightsSelected verifies that the selection indicator
+// appears in the View output when a task is selected.
+func TestKanbanPanel_ViewHighlightsSelected(t *testing.T) {
+	p := NewKanbanPanel()
+	p.SetSize(80, 30)
+	p.Show()
+	p.SetTasks([]KanbanTask{
+		{ID: "T1", Title: "Running task", Status: "running"},
+		{ID: "T2", Title: "Blocked task", Status: "blocked"},
+	}, "")
+	view := p.View()
+	if !strings.Contains(view, "▶") {
+		t.Error("View() should contain ▶ selection indicator")
 	}
 }

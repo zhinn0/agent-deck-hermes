@@ -1,6 +1,10 @@
 package session
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -171,5 +175,108 @@ func TestKanbanWatcher_BuildHTTPURL(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("buildHTTPURL(%q) = %q, want %q", tt.input, got, tt.want)
 		}
+	}
+}
+
+// TestKanbanWatcher_TaskStatus_AfterSeed starts a mock HTTP server returning
+// a board with tasks of varying statuses and verifies seedCounts populates
+// the taskStatuses map correctly.
+func TestKanbanWatcher_TaskStatus_AfterSeed(t *testing.T) {
+	board := kanbanBoardResponse{
+		Tasks: []kanbanTask{
+			{ID: "t_abc123", Status: "running"},
+			{ID: "t_def456", Status: "blocked"},
+			{ID: "t_ghi789", Status: "completed"},
+			{ID: "t_jkl012", Status: "claimed"},
+		},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(board)
+	}))
+	defer srv.Close()
+
+	watcher := NewKanbanWatcher(srv.URL)
+	running, blocked, statuses, err := watcher.seedCounts(context.Background())
+	if err != nil {
+		t.Fatalf("seedCounts: %v", err)
+	}
+
+	if running != 2 {
+		t.Errorf("running = %d, want 2 (one running + one claimed)", running)
+	}
+	if blocked != 1 {
+		t.Errorf("blocked = %d, want 1", blocked)
+	}
+
+	if got := statuses["t_abc123"]; got != "running" {
+		t.Errorf("statuses[t_abc123] = %q, want %q", got, "running")
+	}
+	if got := statuses["t_jkl012"]; got != "running" {
+		t.Errorf("statuses[t_jkl012] = %q, want %q (claimed maps to running)", got, "running")
+	}
+	if got := statuses["t_def456"]; got != "blocked" {
+		t.Errorf("statuses[t_def456] = %q, want %q", got, "blocked")
+	}
+	if got := statuses["t_ghi789"]; got != "" {
+		t.Errorf("statuses[t_ghi789] = %q, want %q (completed not tracked)", got, "")
+	}
+
+	// Verify TaskStatus returns correctly after setCountsAndStatusesAndNotify.
+	watcher.setCountsAndStatusesAndNotify(running, blocked, statuses)
+	if got := watcher.TaskStatus("t_abc123"); got != "running" {
+		t.Errorf("TaskStatus(t_abc123) = %q, want %q", got, "running")
+	}
+	if got := watcher.TaskStatus("t_def456"); got != "blocked" {
+		t.Errorf("TaskStatus(t_def456) = %q, want %q", got, "blocked")
+	}
+	if got := watcher.TaskStatus("t_ghi789"); got != "" {
+		t.Errorf("TaskStatus(t_ghi789) = %q, want empty (terminal)", got)
+	}
+}
+
+// TestKanbanWatcher_TaskStatus_AfterApplyEvent verifies that applyEvent correctly
+// updates the per-task status map through claim → blocked → completed transitions.
+func TestKanbanWatcher_TaskStatus_AfterApplyEvent(t *testing.T) {
+	w := NewKanbanWatcher("http://127.0.0.1:0")
+
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "t_abc123"})
+	if got := w.TaskStatus("t_abc123"); got != "running" {
+		t.Errorf("after claimed: TaskStatus = %q, want %q", got, "running")
+	}
+
+	w.applyEvent(kanbanEvent{ID: 2, Kind: "blocked", TaskID: "t_abc123"})
+	if got := w.TaskStatus("t_abc123"); got != "blocked" {
+		t.Errorf("after blocked: TaskStatus = %q, want %q", got, "blocked")
+	}
+
+	w.applyEvent(kanbanEvent{ID: 3, Kind: "completed", TaskID: "t_abc123"})
+	if got := w.TaskStatus("t_abc123"); got != "" {
+		t.Errorf("after completed: TaskStatus = %q, want empty (terminal)", got)
+	}
+}
+
+// TestKanbanWatcher_TaskStatus_Unblocked verifies that an "unblocked" event
+// transitions a task from blocked back to running.
+func TestKanbanWatcher_TaskStatus_Unblocked(t *testing.T) {
+	w := NewKanbanWatcher("http://127.0.0.1:0")
+
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "blocked", TaskID: "t_abc123"})
+	if got := w.TaskStatus("t_abc123"); got != "blocked" {
+		t.Errorf("after blocked: TaskStatus = %q, want %q", got, "blocked")
+	}
+
+	w.applyEvent(kanbanEvent{ID: 2, Kind: "unblocked", TaskID: "t_abc123"})
+	if got := w.TaskStatus("t_abc123"); got != "running" {
+		t.Errorf("after unblocked: TaskStatus = %q, want %q", got, "running")
+	}
+}
+
+// TestKanbanWatcher_TaskStatus_UnknownTask verifies that TaskStatus returns ""
+// for a task ID that has never been seen.
+func TestKanbanWatcher_TaskStatus_UnknownTask(t *testing.T) {
+	w := NewKanbanWatcher("http://127.0.0.1:0")
+	if got := w.TaskStatus("t_nonexistent"); got != "" {
+		t.Errorf("TaskStatus(t_nonexistent) = %q, want empty", got)
 	}
 }

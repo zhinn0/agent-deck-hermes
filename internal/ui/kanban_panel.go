@@ -35,6 +35,10 @@ type KanbanPanel struct {
 	fetchedAt time.Time
 	fetchErr  string
 	loading   bool
+
+	selectedCol int    // 0 = running column, 1 = blocked column
+	selectedRow int    // index within that column's task list
+	notice      string // transient message shown in header (e.g. "no linked session")
 }
 
 // NewKanbanPanel creates a hidden kanban panel.
@@ -51,6 +55,8 @@ func (p *KanbanPanel) IsVisible() bool {
 }
 
 // Show makes the panel visible and triggers a data refresh.
+// The cursor position is intentionally preserved so reopening the panel
+// remembers where the user was.
 func (p *KanbanPanel) Show() {
 	if p == nil {
 		return
@@ -90,7 +96,16 @@ func (p *KanbanPanel) SetSize(width, height int) {
 	p.height = height
 }
 
-// SetTasks updates the displayed task list.
+// SetNotice sets a transient message shown in the panel header (e.g. "no linked session").
+// Cleared automatically on the next SetTasks call.
+func (p *KanbanPanel) SetNotice(msg string) {
+	if p == nil {
+		return
+	}
+	p.notice = msg
+}
+
+// SetTasks updates the displayed task list and clamps the cursor to stay valid.
 func (p *KanbanPanel) SetTasks(tasks []KanbanTask, err string) {
 	if p == nil {
 		return
@@ -99,6 +114,122 @@ func (p *KanbanPanel) SetTasks(tasks []KanbanTask, err string) {
 	p.fetchErr = err
 	p.loading = false
 	p.fetchedAt = time.Now()
+	p.notice = ""
+
+	running, blocked := p.colTasks()
+	col := running
+	if p.selectedCol == 1 {
+		col = blocked
+	}
+
+	// If current column is now empty but the other isn't, switch over.
+	if len(col) == 0 {
+		other := blocked
+		if p.selectedCol == 1 {
+			other = running
+		}
+		if len(other) > 0 {
+			p.selectedCol = 1 - p.selectedCol
+			col = other
+		}
+	}
+
+	maxRow := len(col) - 1
+	if maxRow < 0 {
+		maxRow = 0
+	}
+	if p.selectedRow > maxRow {
+		p.selectedRow = maxRow
+	}
+}
+
+// colTasks splits p.tasks into running and blocked slices.
+func (p *KanbanPanel) colTasks() (running, blocked []KanbanTask) {
+	for _, t := range p.tasks {
+		switch t.Status {
+		case "running", "claimed":
+			running = append(running, t)
+		case "blocked":
+			blocked = append(blocked, t)
+		}
+	}
+	return
+}
+
+// MoveUp moves the cursor up in the current column, clamping at row 0.
+func (p *KanbanPanel) MoveUp() {
+	if p == nil {
+		return
+	}
+	running, blocked := p.colTasks()
+	col := running
+	if p.selectedCol == 1 {
+		col = blocked
+	}
+	if len(col) == 0 {
+		return
+	}
+	if p.selectedRow > 0 {
+		p.selectedRow--
+	}
+}
+
+// MoveDown moves the cursor down in the current column, clamping at the last row.
+func (p *KanbanPanel) MoveDown() {
+	if p == nil {
+		return
+	}
+	running, blocked := p.colTasks()
+	col := running
+	if p.selectedCol == 1 {
+		col = blocked
+	}
+	if len(col) == 0 {
+		return
+	}
+	if p.selectedRow < len(col)-1 {
+		p.selectedRow++
+	}
+}
+
+// SwitchColumn toggles between running (0) and blocked (1) columns, clamping
+// selectedRow to the new column's length.
+func (p *KanbanPanel) SwitchColumn() {
+	if p == nil {
+		return
+	}
+	p.selectedCol = 1 - p.selectedCol
+	running, blocked := p.colTasks()
+	col := running
+	if p.selectedCol == 1 {
+		col = blocked
+	}
+	if len(col) == 0 {
+		p.selectedRow = 0
+		return
+	}
+	maxRow := len(col) - 1
+	if p.selectedRow > maxRow {
+		p.selectedRow = maxRow
+	}
+}
+
+// SelectedTask returns a pointer to the currently selected task, or nil if the
+// column is empty or the index is out of range.
+func (p *KanbanPanel) SelectedTask() *KanbanTask {
+	if p == nil {
+		return nil
+	}
+	running, blocked := p.colTasks()
+	col := running
+	if p.selectedCol == 1 {
+		col = blocked
+	}
+	if len(col) == 0 || p.selectedRow >= len(col) {
+		return nil
+	}
+	t := col[p.selectedRow]
+	return &t
 }
 
 // FetchKanbanTasks fetches running and blocked Hermes Kanban tasks.
@@ -160,16 +291,7 @@ func (p *KanbanPanel) View() string {
 	blockStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("1")) // red for blocked
 
-	// Separate tasks
-	var running, blocked []KanbanTask
-	for _, t := range p.tasks {
-		switch t.Status {
-		case "running", "claimed":
-			running = append(running, t)
-		case "blocked":
-			blocked = append(blocked, t)
-		}
-	}
+	running, blocked := p.colTasks()
 
 	var content string
 	innerW := w - 4 // subtract border + padding
@@ -190,9 +312,11 @@ func (p *KanbanPanel) View() string {
 		header += dimStyle.Render("  loading…")
 	} else if p.fetchErr != "" {
 		header += lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Render("  " + p.fetchErr)
+	} else if p.notice != "" {
+		header += dimStyle.Render("  " + p.notice)
 	}
 
-	keyhint := dimStyle.Render("  r refresh · B/esc close")
+	keyhint := dimStyle.Render("  ↑↓ select · ←→ switch col · ↵ go to session · r refresh · esc close")
 
 	body := header + "\n" + keyhint + "\n\n" + content
 
@@ -214,8 +338,8 @@ func (p *KanbanPanel) renderTwoColumn(
 ) string {
 	colW := (width - 3) / 2 // 3 for " │ " divider
 
-	leftLines := renderTaskColumn("● RUNNING", running, colW, runStyle, dimStyle, false)
-	rightLines := renderTaskColumn("▲ BLOCKED", blocked, colW, blockStyle, dimStyle, true)
+	leftLines := renderTaskColumn("● RUNNING", running, colW, runStyle, dimStyle, false, p.selectedRow, p.selectedCol == 0)
+	rightLines := renderTaskColumn("▲ BLOCKED", blocked, colW, blockStyle, dimStyle, true, p.selectedRow, p.selectedCol == 1)
 
 	// Pad shorter column
 	maxRows := len(leftLines)
@@ -249,8 +373,12 @@ func (p *KanbanPanel) renderSingleColumn(
 	if len(running) == 0 {
 		lines = append(lines, dimStyle.Render("  (none)"))
 	} else {
-		for _, t := range running {
-			lines = append(lines, "  "+truncate(t.Title, width-3))
+		for i, t := range running {
+			if p.selectedCol == 0 && i == p.selectedRow {
+				lines = append(lines, SessionSelectionPrefix.Render("▶")+" "+SessionTitleSelStyle.Render(truncate(t.Title, width-3)))
+			} else {
+				lines = append(lines, "  "+truncate(t.Title, width-3))
+			}
 			if t.Assignee != "" {
 				lines = append(lines, dimStyle.Render("    "+t.Assignee))
 			}
@@ -263,8 +391,12 @@ func (p *KanbanPanel) renderSingleColumn(
 	if len(blocked) == 0 {
 		lines = append(lines, dimStyle.Render("  (none)"))
 	} else {
-		for _, t := range blocked {
-			lines = append(lines, "  "+truncate(t.Title, width-3))
+		for i, t := range blocked {
+			if p.selectedCol == 1 && i == p.selectedRow {
+				lines = append(lines, SessionSelectionPrefix.Render("▶")+" "+SessionTitleSelStyle.Render(truncate(t.Title, width-3)))
+			} else {
+				lines = append(lines, "  "+truncate(t.Title, width-3))
+			}
 			if t.BlockReason != "" {
 				lines = append(lines, dimStyle.Render("    ↳ "+truncate(t.BlockReason, width-6)))
 			}
@@ -281,16 +413,32 @@ func renderTaskColumn(
 	colW int,
 	headerStyle, dimStyle lipgloss.Style,
 	showBlockReason bool,
+	selectedRow int,
+	isActiveCol bool,
 ) []string {
 	var lines []string
-	lines = append(lines, headerStyle.Render(pad(header, colW)))
+
+	// Active column header is rendered normally; inactive column is dimmed.
+	if isActiveCol {
+		lines = append(lines, headerStyle.Render(pad(header, colW)))
+	} else {
+		lines = append(lines, dimStyle.Render(pad(header, colW)))
+	}
 	lines = append(lines, strings.Repeat("─", colW))
 
 	if len(tasks) == 0 {
 		lines = append(lines, dimStyle.Render(pad("(none)", colW)))
 	} else {
-		for _, t := range tasks {
-			lines = append(lines, pad(truncate(t.Title, colW), colW))
+		for i, t := range tasks {
+			if isActiveCol && i == selectedRow {
+				prefix := SessionSelectionPrefix.Render("▶")
+				// Width(colW-2) pads to exactly colW-2 visible chars so the
+				// divider in renderTwoColumn lands at the correct column.
+				title := SessionTitleSelStyle.Width(colW - 2).Render(truncate(t.Title, colW-2))
+				lines = append(lines, prefix+" "+title)
+			} else {
+				lines = append(lines, pad(truncate(t.Title, colW), colW))
+			}
 			if t.Assignee != "" {
 				lines = append(lines, dimStyle.Render(pad(truncate("  "+t.Assignee, colW), colW)))
 			}
@@ -326,7 +474,6 @@ type kanbanFetchDoneMsg struct {
 	tasks []KanbanTask
 	err   string
 }
-
 
 func isHermesNotFound(err error) bool {
 	if err == nil {

@@ -2402,9 +2402,32 @@ When you first start (or after a restart):
 2. Read ` + "`" + `./LEARNINGS.md` + "`" + ` and ` + "`" + `../LEARNINGS.md` + "`" + ` if they exist (review past patterns)
 3. Run ` + "`" + `agent-deck -p {PROFILE} status --json` + "`" + ` to get the current state
 4. Run ` + "`" + `agent-deck -p {PROFILE} list --json` + "`" + ` to know what sessions exist
-5. Log startup in ` + "`" + `./task-log.md` + "`" + `
-6. If any sessions are in error state (NOT stopped), try to restart them. Sessions in "stopped" status were intentionally closed by the user and must NOT be restarted.
-7. Reply: "Conductor {NAME} ({PROFILE}) online. N sessions tracked (X running, Y waiting)."
+5. Run ` + "`" + `hermes kanban list --status blocked --json` + "`" + ` to check for blocked tasks needing attention
+6. Log startup in ` + "`" + `./task-log.md` + "`" + `
+7. If any sessions are in error state (NOT stopped), try to restart them. Sessions in "stopped" status were intentionally closed by the user and must NOT be restarted.
+8. Reply: "Conductor {NAME} ({PROFILE}) online. N sessions tracked (X running, Y waiting). K kanban tasks active."
+
+## Kanban Escalation
+
+When escalating a session to the user, create a durable Kanban record alongside the notification:
+
+` + "```" + `bash
+# 1. Create the task in triage
+id=$(hermes kanban create "<session-title>: needs input" \
+  --body "<last output excerpt>" --triage --json | jq -r .id)
+
+# 2. Immediately block it with the reason
+hermes kanban block "$id" "<escalation reason>"
+` + "```" + `
+
+When the user responds and you auto-reply to the session, close the loop:
+` + "```" + `bash
+hermes kanban unblock <id>
+hermes kanban complete <id> --summary "<what was decided>"
+` + "```" + `
+
+Only use Kanban for escalations that need a durable record. Routine heartbeat
+checks and simple auto-responses do not need Kanban entries.
 
 ## Policy
 

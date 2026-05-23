@@ -350,6 +350,12 @@ type Instance struct {
 	// config then Restart immediately overwrites it with different pool state
 	SkipMCPRegenerate bool `json:"-"` // Don't persist, transient flag
 
+	// Hermes CLI integration
+	// KanbanTaskID links this session to a specific Hermes Kanban task.
+	// When set, HERMES_KANBAN_TASK is injected at launch so the session
+	// receives the full kanban_* tool set (show, complete, block, heartbeat).
+	KanbanTaskID string `json:"kanban_task_id,omitempty"`
+
 	// Gateway health cache for Hermes sessions (volatile, not persisted).
 	hermesGatewayCheckedAt time.Time
 	hermesGatewayOK        bool
