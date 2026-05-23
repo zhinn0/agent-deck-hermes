@@ -231,8 +231,8 @@ func GetHermesKanbanCounts() (running, blocked int) {
 func refreshHermesKanbanCache() {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "hermes", "kanban", "list",
-		"--status", "running,blocked", "--json").Output()
+	// hermes --status only accepts a single value, so fetch all and filter.
+	out, err := exec.CommandContext(ctx, "hermes", "kanban", "list", "--json").Output()
 	if err != nil {
 		return
 	}

@@ -92,16 +92,32 @@ func handleKanbanList(args []string) {
 		fmt.Fprintf(os.Stderr, "Note: Hermes Kanban is global — -p/--profile flag is accepted but has no effect.\n")
 	}
 
-	// Default status filter.
-	status := "running,blocked"
 	// Check for --status flag in remaining args.
 	clean, statusVal := extractKanbanStatusFlag(filtered)
-	if statusVal != "" {
-		status = statusVal
+
+	// hermes --status only accepts a single value. When multiple statuses are
+	// requested (comma-separated), run one hermes call per status so results
+	// are combined. With no filter, list all tasks.
+	if statusVal == "" {
+		runHermes(append([]string{"kanban", "list"}, clean...))
+		return
 	}
 
-	hermesArgs := append([]string{"kanban", "list", "--status", status}, clean...)
-	runHermes(hermesArgs)
+	statuses := strings.Split(statusVal, ",")
+	if len(statuses) == 1 {
+		hermesArgs := append([]string{"kanban", "list", "--status", statuses[0]}, clean...)
+		runHermes(hermesArgs)
+		return
+	}
+
+	for _, s := range statuses {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		hermesArgs := append([]string{"kanban", "list", "--status", s}, clean...)
+		runHermes(hermesArgs)
+	}
 }
 
 // handleKanbanPassthrough runs `hermes kanban <verb> <args...>` verbatim,
