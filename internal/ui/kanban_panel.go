@@ -290,12 +290,12 @@ func renderTaskColumn(
 		lines = append(lines, dimStyle.Render(pad("(none)", colW)))
 	} else {
 		for _, t := range tasks {
-			lines = append(lines, truncate(t.Title, colW))
+			lines = append(lines, pad(truncate(t.Title, colW), colW))
 			if t.Assignee != "" {
-				lines = append(lines, dimStyle.Render(truncate("  "+t.Assignee, colW)))
+				lines = append(lines, dimStyle.Render(pad(truncate("  "+t.Assignee, colW), colW)))
 			}
 			if showBlockReason && t.BlockReason != "" {
-				lines = append(lines, dimStyle.Render(truncate("  ↳ "+t.BlockReason, colW)))
+				lines = append(lines, dimStyle.Render(pad(truncate("  ↳ "+t.BlockReason, colW), colW)))
 			}
 		}
 	}
