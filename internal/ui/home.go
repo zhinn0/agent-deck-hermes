@@ -4656,14 +4656,12 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case kanbanCountsChangedMsg:
-		// CLI poll tick fired — re-render badge and re-arm the next tick.
-		// Also re-arm the watcher listener in case it was not yet running.
-		var cmds []tea.Cmd
-		if h.kanbanWatcher != nil {
-			cmds = append(cmds, listenForKanbanUpdates(h.kanbanWatcher))
-		}
-		cmds = append(cmds, kanbanPollCmd())
-		return h, tea.Batch(cmds...)
+		// CLI poll tick fired — re-render badge and re-arm the next tick only.
+		// Do NOT call listenForKanbanUpdates here: each call adds a new channel
+		// to KanbanWatcher.subs and leaves the previous goroutine running,
+		// causing subscription count to grow unboundedly. Watcher lifecycle is
+		// managed exclusively by Init() and the kanbanWatcherChangedMsg handler.
+		return h, kanbanPollCmd()
 
 	case kanbanFetchDoneMsg:
 		if h.kanbanPanel != nil {
