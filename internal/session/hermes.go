@@ -151,21 +151,26 @@ func HermesSharedWorkspaceDir() string {
 	return filepath.Join(os.TempDir(), "hermes-workspaces")
 }
 
-// globalKanbanWatcher is the singleton KanbanWatcher started when a Hermes gateway is detected.
+// globalKanbanWatcher is the process-wide KanbanWatcher pointed at the local
+// ~/.hermes/kanban.db. The watcher polls the SQLite file directly — same
+// data source the Hermes CLI, dashboard plugin, and gateway notifier all read.
 var (
 	globalKanbanWatcher *KanbanWatcher
 	kanbanWatcherMu     sync.Mutex
 )
 
-// StartKanbanWatcher starts the WebSocket-based Kanban watcher if not already running.
+// StartKanbanWatcher starts the Kanban watcher rooted at ~/.hermes/kanban.db
+// if not already running. The watcher tolerates a missing kanban.db (stays
+// unhealthy until the file appears), so it is always safe to call.
 // Subsequent calls return the existing watcher. Safe for concurrent use.
-func StartKanbanWatcher(gatewayURL string) *KanbanWatcher {
+func StartKanbanWatcher() *KanbanWatcher {
 	kanbanWatcherMu.Lock()
 	defer kanbanWatcherMu.Unlock()
 	if globalKanbanWatcher != nil {
 		return globalKanbanWatcher
 	}
-	w := NewKanbanWatcher(gatewayURL)
+	dbPath := filepath.Join(GetHermesConfigDir(), "kanban.db")
+	w := NewKanbanWatcher(dbPath)
 	w.Start()
 	globalKanbanWatcher = w
 	return w
@@ -244,9 +249,9 @@ var kanbanCache struct {
 const kanbanCacheTTL = 15 * time.Second
 
 // GetHermesKanbanCounts returns the current running and blocked task counts.
-// Prefers the WebSocket KanbanWatcher (real-time) when available and healthy;
-// falls back to stale-while-revalidate CLI polling otherwise.
-// Returns (0, 0) if hermes is not in PATH or the CLI call fails.
+// Prefers the in-process KanbanWatcher (sub-second SQLite poll) when healthy;
+// falls back to stale-while-revalidate `hermes kanban list` CLI polling
+// otherwise. Returns (0, 0) if neither source is available.
 func GetHermesKanbanCounts() (running, blocked int) {
 	kanbanWatcherMu.Lock()
 	w := globalKanbanWatcher
@@ -324,9 +329,8 @@ func ForceRefreshHermesKanbanCache() {
 
 // GetHermesKanbanTaskStatus returns the current kanban status for a specific task ID.
 // Returns "running", "blocked", or "" (task not active / not found).
-// Prefers the WebSocket KanbanWatcher when healthy; falls back to the
-// stale-while-revalidate CLI cache otherwise (including when the watcher is
-// running but the kanban WebSocket endpoint is unavailable in this gateway version).
+// Prefers the in-process KanbanWatcher when healthy; falls back to the
+// stale-while-revalidate CLI cache when kanban.db is missing or unreadable.
 func GetHermesKanbanTaskStatus(taskID string) string {
 	if taskID == "" {
 		return ""

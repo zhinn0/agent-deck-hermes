@@ -1,667 +1,612 @@
 package session
 
 import (
-	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
-	"sync"
-	"sync/atomic"
+	"database/sql"
+	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
+	_ "modernc.org/sqlite"
 )
 
-// TestKanbanWatcher_CountsStartAtZero verifies that a newly created watcher
-// reports zero for both running and blocked counts before any events are applied.
-func TestKanbanWatcher_CountsStartAtZero(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0") // unreachable; no Start()
-	running, blocked := w.Counts()
-	if running != 0 {
-		t.Errorf("running = %d, want 0", running)
-	}
-	if blocked != 0 {
-		t.Errorf("blocked = %d, want 0", blocked)
-	}
-}
-
-// TestKanbanWatcher_StopIsIdempotent verifies that calling Stop() multiple times
-// does not panic or deadlock.
-func TestKanbanWatcher_StopIsIdempotent(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-	w.Stop()
-	w.Stop() // second call must not panic
-	w.Stop() // third call must not panic
-}
-
-// TestKanbanWatcher_SubscribeNotifies verifies that a subscriber channel
-// receives a notification when a count-changing event is applied.
-func TestKanbanWatcher_SubscribeNotifies(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-	ch := w.Subscribe()
-
-	// Apply a "claimed" event which increments running count.
-	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "task-1"})
-
-	select {
-	case <-ch:
-		// good
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for subscriber notification after claimed event")
-	}
-
-	// Verify count changed.
-	running, _ := w.Counts()
-	if running != 1 {
-		t.Errorf("running = %d, want 1 after claimed event", running)
-	}
-}
-
-// TestKanbanWatcher_SubscribeNoNotifyOnNoChange verifies that applying an event
-// that does not change counts does not notify.
-// "unblocked" for a task with no prior tracked state is a stale/out-of-order
-// event — we have no proof it was blocked, so counts must not change.
-func TestKanbanWatcher_SubscribeNoNotifyOnNoChange(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-	ch := w.Subscribe()
-
-	// "unblocked" for an unseen task — must be a no-op.
-	w.applyEvent(kanbanEvent{ID: 1, Kind: "unblocked", TaskID: "task-1"})
-
-	select {
-	case <-ch:
-		t.Error("received unexpected notification: unblocked for unseen task should be a no-op")
-	case <-time.After(50 * time.Millisecond):
-		// good — no spurious notification
-	}
-	running, blocked := w.Counts()
-	if running != 0 || blocked != 0 {
-		t.Errorf("counts after unseen-task unblocked: running=%d blocked=%d, want 0 0", running, blocked)
-	}
-}
-
-// TestKanbanWatcher_ApplyEventClaimed verifies running increments on "claimed".
-func TestKanbanWatcher_ApplyEventClaimed(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed"})
-	running, blocked := w.Counts()
-	if running != 1 || blocked != 0 {
-		t.Errorf("after claimed: running=%d blocked=%d, want 1 0", running, blocked)
-	}
-}
-
-// TestKanbanWatcher_ApplyEventCompleted verifies running decrements on "completed".
-func TestKanbanWatcher_ApplyEventCompleted(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed"})
-	w.applyEvent(kanbanEvent{ID: 2, Kind: "completed"})
-	running, blocked := w.Counts()
-	if running != 0 || blocked != 0 {
-		t.Errorf("after claimed+completed: running=%d blocked=%d, want 0 0", running, blocked)
-	}
-}
-
-// TestKanbanWatcher_ApplyEventBlocked verifies blocked increments on "blocked".
-func TestKanbanWatcher_ApplyEventBlocked(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-	w.applyEvent(kanbanEvent{ID: 1, Kind: "blocked"})
-	running, blocked := w.Counts()
-	if running != 0 || blocked != 1 {
-		t.Errorf("after blocked: running=%d blocked=%d, want 0 1", running, blocked)
-	}
-}
-
-// TestKanbanWatcher_ApplyEventUnblocked verifies that blocked→running transition
-// correctly swaps counters. After blocked+unblocked the task is running (not gone).
-func TestKanbanWatcher_ApplyEventUnblocked(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-	// Use a task ID so state is tracked. No-ID path uses best-effort swap.
-	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "t_x"})
-	w.applyEvent(kanbanEvent{ID: 2, Kind: "blocked", TaskID: "t_x"})
-	w.applyEvent(kanbanEvent{ID: 3, Kind: "unblocked", TaskID: "t_x"})
-	running, blocked := w.Counts()
-	if running != 1 || blocked != 0 {
-		t.Errorf("after claimed+blocked+unblocked: running=%d blocked=%d, want 1 0", running, blocked)
-	}
-}
-
-// TestKanbanWatcher_ApplyEventCrashed verifies running decrements on "crashed".
-func TestKanbanWatcher_ApplyEventCrashed(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed"})
-	w.applyEvent(kanbanEvent{ID: 2, Kind: "crashed"})
-	running, blocked := w.Counts()
-	if running != 0 || blocked != 0 {
-		t.Errorf("after claimed+crashed: running=%d blocked=%d, want 0 0", running, blocked)
-	}
-}
-
-// TestKanbanWatcher_ApplyEvent_Reclaimed_FromRunning verifies reclaimed running task stays running.
-func TestKanbanWatcher_ApplyEvent_Reclaimed_FromRunning(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "t1"})
-	w.applyEvent(kanbanEvent{ID: 2, Kind: "reclaimed", TaskID: "t1"})
-	running, blocked := w.Counts()
-	if running != 1 || blocked != 0 {
-		t.Errorf("after claimed+reclaimed: running=%d blocked=%d, want 1 0", running, blocked)
-	}
-	if w.TaskStatus("t1") != "running" {
-		t.Errorf("TaskStatus after reclaimed = %q, want running", w.TaskStatus("t1"))
-	}
-}
-
-// TestKanbanWatcher_ApplyEvent_Reclaimed_FromBlocked verifies blocked→running on reclaim.
-func TestKanbanWatcher_ApplyEvent_Reclaimed_FromBlocked(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "t1"})
-	w.applyEvent(kanbanEvent{ID: 2, Kind: "blocked", TaskID: "t1"})
-	w.applyEvent(kanbanEvent{ID: 3, Kind: "reclaimed", TaskID: "t1"})
-	running, blocked := w.Counts()
-	if running != 1 || blocked != 0 {
-		t.Errorf("after claimed+blocked+reclaimed: running=%d blocked=%d, want 1 0", running, blocked)
-	}
-}
-
-// TestKanbanWatcher_Unsubscribe verifies that after Unsubscribe, the removed
-// channel receives no notifications while remaining subscribers still do.
-func TestKanbanWatcher_Unsubscribe(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-	ch1 := w.Subscribe()
-	ch2 := w.Subscribe()
-
-	w.Unsubscribe(ch1)
-
-	// Trigger a count change so notify() fires.
-	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "t_unsub"})
-
-	// ch2 must receive the notification.
-	select {
-	case <-ch2:
-		// ok
-	case <-time.After(200 * time.Millisecond):
-		t.Error("ch2 did not receive notification after event; Unsubscribe may have removed wrong channel")
-	}
-
-	// ch1 must NOT receive the notification.
-	select {
-	case <-ch1:
-		t.Error("ch1 received notification after Unsubscribe; channel was not removed")
-	default:
-		// ok
-	}
-}
-
-// TestKanbanWatcher_NeverNegative verifies the underflow guards pin counts at
-// exactly zero (not just non-negative). Uses == rather than < to catch a
-// regression where applyEvent erroneously incremented counts on terminal events.
-func TestKanbanWatcher_NeverNegative(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-	// No-task-ID underflow paths.
-	w.applyEvent(kanbanEvent{ID: 1, Kind: "completed"})
-	w.applyEvent(kanbanEvent{ID: 2, Kind: "crashed"})
-	w.applyEvent(kanbanEvent{ID: 3, Kind: "unblocked"})
-	if running, blocked := w.Counts(); running != 0 || blocked != 0 {
-		t.Errorf("no-task-id underflow: running=%d blocked=%d, want 0 0", running, blocked)
-	}
-
-	// Task-ID-present completed for an unseen task — no prev state, must be a no-op.
-	w.applyEvent(kanbanEvent{ID: 4, Kind: "completed", TaskID: "t_phantom"})
-	w.applyEvent(kanbanEvent{ID: 5, Kind: "blocked", TaskID: "t_phantom"})
-	w.applyEvent(kanbanEvent{ID: 6, Kind: "completed", TaskID: "t_phantom"})
-	if running, blocked := w.Counts(); running != 0 || blocked != 0 {
-		t.Errorf("phantom-task sequence drifted counts: running=%d blocked=%d, want 0 0", running, blocked)
-	}
-}
-
-// TestKanbanWatcher_BuildWSURL verifies URL conversion from HTTP to WebSocket.
-func TestKanbanWatcher_BuildWSURL(t *testing.T) {
-	tests := []struct {
-		input string
-		want  string
-	}{
-		{"http://127.0.0.1:8080", "ws://127.0.0.1:8080/api/plugins/kanban/events"},
-		{"https://example.com", "wss://example.com/api/plugins/kanban/events"},
-		{"ws://127.0.0.1:9000", "ws://127.0.0.1:9000/api/plugins/kanban/events"},
-		{"wss://example.com", "wss://example.com/api/plugins/kanban/events"},
-		{"http://127.0.0.1:8080/", "ws://127.0.0.1:8080/api/plugins/kanban/events"},
-	}
-	for _, tt := range tests {
-		w := NewKanbanWatcher(tt.input)
-		got := w.buildWSURL()
-		if got != tt.want {
-			t.Errorf("buildWSURL(%q) = %q, want %q", tt.input, got, tt.want)
-		}
-	}
-}
-
-// TestKanbanWatcher_BuildHTTPURL verifies URL conversion from WS to HTTP.
-func TestKanbanWatcher_BuildHTTPURL(t *testing.T) {
-	tests := []struct {
-		input string
-		want  string
-	}{
-		{"http://127.0.0.1:8080", "http://127.0.0.1:8080"},
-		{"https://example.com", "https://example.com"},
-		{"ws://127.0.0.1:9000", "http://127.0.0.1:9000"},
-		{"wss://example.com", "https://example.com"},
-	}
-	for _, tt := range tests {
-		w := NewKanbanWatcher(tt.input)
-		got := w.buildHTTPURL()
-		if got != tt.want {
-			t.Errorf("buildHTTPURL(%q) = %q, want %q", tt.input, got, tt.want)
-		}
-	}
-}
-
-// TestKanbanWatcher_TaskStatus_AfterSeed starts a mock HTTP server returning
-// a board with tasks of varying statuses and verifies seedCounts populates
-// the taskStatuses map correctly.
-func TestKanbanWatcher_TaskStatus_AfterSeed(t *testing.T) {
-	board := kanbanBoardResponse{
-		Tasks: []kanbanTask{
-			{ID: "t_abc123", Status: "running"},
-			{ID: "t_def456", Status: "blocked"},
-			{ID: "t_ghi789", Status: "completed"},
-			{ID: "t_jkl012", Status: "claimed"},
-		},
-	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(board)
-	}))
-	defer srv.Close()
-
-	watcher := NewKanbanWatcher(srv.URL)
-	running, blocked, statuses, err := watcher.seedCounts(context.Background())
+// makeTestDB creates a fresh SQLite file in a temp dir with the Hermes
+// kanban.db schema. Returns the path and an open *sql.DB the caller can use
+// to seed rows. The DB is closed automatically when the test ends.
+func makeTestDB(t *testing.T) (path string, db *sql.DB) {
+	t.Helper()
+	dir := t.TempDir()
+	path = filepath.Join(dir, "kanban.db")
+	d, err := sql.Open("sqlite", path)
 	if err != nil {
-		t.Fatalf("seedCounts: %v", err)
+		t.Fatalf("open: %v", err)
 	}
-
-	if running != 2 {
-		t.Errorf("running = %d, want 2 (one running + one claimed)", running)
-	}
-	if blocked != 1 {
-		t.Errorf("blocked = %d, want 1", blocked)
-	}
-
-	if got := statuses["t_abc123"]; got != "running" {
-		t.Errorf("statuses[t_abc123] = %q, want %q", got, "running")
-	}
-	if got := statuses["t_jkl012"]; got != "running" {
-		t.Errorf("statuses[t_jkl012] = %q, want %q (claimed maps to running)", got, "running")
-	}
-	if got := statuses["t_def456"]; got != "blocked" {
-		t.Errorf("statuses[t_def456] = %q, want %q", got, "blocked")
-	}
-	if got := statuses["t_ghi789"]; got != "" {
-		t.Errorf("statuses[t_ghi789] = %q, want %q (completed not tracked)", got, "")
-	}
-
-	// Verify TaskStatus returns correctly after setCountsAndStatusesAndNotify.
-	watcher.setCountsAndStatusesAndNotify(running, blocked, statuses, false)
-	if got := watcher.TaskStatus("t_abc123"); got != "running" {
-		t.Errorf("TaskStatus(t_abc123) = %q, want %q", got, "running")
-	}
-	if got := watcher.TaskStatus("t_def456"); got != "blocked" {
-		t.Errorf("TaskStatus(t_def456) = %q, want %q", got, "blocked")
-	}
-	if got := watcher.TaskStatus("t_ghi789"); got != "" {
-		t.Errorf("TaskStatus(t_ghi789) = %q, want empty (terminal)", got)
-	}
-}
-
-// TestKanbanWatcher_TaskStatus_AfterApplyEvent verifies that applyEvent correctly
-// updates the per-task status map through claim → blocked → completed transitions.
-func TestKanbanWatcher_TaskStatus_AfterApplyEvent(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-
-	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "t_abc123"})
-	if got := w.TaskStatus("t_abc123"); got != "running" {
-		t.Errorf("after claimed: TaskStatus = %q, want %q", got, "running")
-	}
-
-	w.applyEvent(kanbanEvent{ID: 2, Kind: "blocked", TaskID: "t_abc123"})
-	if got := w.TaskStatus("t_abc123"); got != "blocked" {
-		t.Errorf("after blocked: TaskStatus = %q, want %q", got, "blocked")
-	}
-
-	w.applyEvent(kanbanEvent{ID: 3, Kind: "completed", TaskID: "t_abc123"})
-	if got := w.TaskStatus("t_abc123"); got != "" {
-		t.Errorf("after completed: TaskStatus = %q, want empty (terminal)", got)
-	}
-}
-
-// TestKanbanWatcher_TaskStatus_Unblocked verifies that an "unblocked" event
-// transitions a task from blocked back to running.
-func TestKanbanWatcher_TaskStatus_Unblocked(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-
-	w.applyEvent(kanbanEvent{ID: 1, Kind: "blocked", TaskID: "t_abc123"})
-	if got := w.TaskStatus("t_abc123"); got != "blocked" {
-		t.Errorf("after blocked: TaskStatus = %q, want %q", got, "blocked")
-	}
-
-	w.applyEvent(kanbanEvent{ID: 2, Kind: "unblocked", TaskID: "t_abc123"})
-	if got := w.TaskStatus("t_abc123"); got != "running" {
-		t.Errorf("after unblocked: TaskStatus = %q, want %q", got, "running")
-	}
-}
-
-// TestKanbanWatcher_TaskStatus_UnknownTask verifies that TaskStatus returns ""
-// for a task ID that has never been seen.
-func TestKanbanWatcher_TaskStatus_UnknownTask(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-	if got := w.TaskStatus("t_nonexistent"); got != "" {
-		t.Errorf("TaskStatus(t_nonexistent) = %q, want empty", got)
-	}
-}
-
-// TestKanbanWatcher_ApplyEvent_RunningToBlocked verifies that a running→blocked
-// transition decrements running AND increments blocked (not just increments blocked).
-// Without state reconciliation this test fails: running stays at 1, blocked hits 1.
-func TestKanbanWatcher_ApplyEvent_RunningToBlocked(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "t_x"})
-	w.applyEvent(kanbanEvent{ID: 2, Kind: "blocked", TaskID: "t_x"})
-	running, blocked := w.Counts()
-	if running != 0 || blocked != 1 {
-		t.Errorf("after claimed+blocked: running=%d blocked=%d, want 0 1", running, blocked)
-	}
-}
-
-// TestKanbanWatcher_ApplyEvent_BlockedToCompleted verifies that completing a blocked
-// task decrements blocked (not running). Without reconciliation this decrements running.
-func TestKanbanWatcher_ApplyEvent_BlockedToCompleted(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "t_x"})
-	w.applyEvent(kanbanEvent{ID: 2, Kind: "blocked", TaskID: "t_x"})
-	w.applyEvent(kanbanEvent{ID: 3, Kind: "completed", TaskID: "t_x"})
-	running, blocked := w.Counts()
-	if running != 0 || blocked != 0 {
-		t.Errorf("after claimed+blocked+completed: running=%d blocked=%d, want 0 0", running, blocked)
-	}
-}
-
-// TestKanbanWatcher_ApplyEvent_DoubleClaimed verifies that a duplicate claimed
-// event for a tracked task does not double-count the running counter.
-func TestKanbanWatcher_ApplyEvent_DoubleClaimed(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "t_x"})
-	// Duplicate claimed with different ID (passed the ID dedup filter)
-	w.applyEvent(kanbanEvent{ID: 2, Kind: "claimed", TaskID: "t_x"})
-	running, _ := w.Counts()
-	if running != 1 {
-		t.Errorf("after double-claimed: running=%d, want 1 (no double-count)", running)
-	}
-}
-
-// TestKanbanWatcher_StartIsIdempotent verifies that calling Start() multiple times
-// does not launch extra goroutines (the reconnect loop must start exactly once).
-// We stop the watcher immediately and verify no panic or deadlock occurs.
-func TestKanbanWatcher_StartIsIdempotent(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-	w.Stop() // pre-stop so reconnectLoop exits immediately when started
-	w.Start()
-	w.Start() // second call must be a no-op
-	w.Start() // third call must be a no-op
-	// If two goroutines were started, both would race to read stopCh.
-	// This test primarily guards against panics; the sync.Once ensures correctness.
-}
-
-// TestKanbanWatcher_ApplyEvent_SkipsDuplicate verifies that replayed events
-// with the same ID are ignored and do not increment counts twice.
-// Before the fix, replaying an event with id=1 would double-count it.
-func TestKanbanWatcher_ApplyEvent_SkipsDuplicate(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-
-	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "t_abc"})
-	running, _ := w.Counts()
-	if running != 1 {
-		t.Fatalf("after first claimed: running=%d, want 1", running)
-	}
-
-	// Replay the same event — must be a no-op.
-	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "t_abc"})
-	running, _ = w.Counts()
-	if running != 1 {
-		t.Errorf("after replayed claimed (same ID): running=%d, want 1 (no double-count)", running)
-	}
-}
-
-// TestKanbanWatcher_ApplyEvent_SkipsOlderID verifies that an event with a lower
-// ID than lastEventID is dropped, preventing out-of-order replay drift.
-func TestKanbanWatcher_ApplyEvent_SkipsOlderID(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-
-	w.applyEvent(kanbanEvent{ID: 5, Kind: "claimed", TaskID: "t_abc"})
-	w.applyEvent(kanbanEvent{ID: 3, Kind: "claimed", TaskID: "t_def"}) // older — must be skipped
-	running, _ := w.Counts()
-	if running != 1 {
-		t.Errorf("after older event replay: running=%d, want 1", running)
-	}
-}
-
-// TestKanbanWatcher_ApplyEvent_ZeroIDNotSkipped verifies that events with ID=0
-// (no sequence number) are always applied regardless of lastEventID.
-func TestKanbanWatcher_ApplyEvent_ZeroIDNotSkipped(t *testing.T) {
-	w := NewKanbanWatcher("http://127.0.0.1:0")
-
-	w.applyEvent(kanbanEvent{ID: 5, Kind: "claimed", TaskID: "t_abc"})
-	w.applyEvent(kanbanEvent{ID: 0, Kind: "claimed", TaskID: "t_def"}) // ID=0 means no sequencing
-	running, _ := w.Counts()
-	if running != 2 {
-		t.Errorf("after ID=0 event: running=%d, want 2", running)
-	}
-}
-
-// kanbanIntegrationServer is a minimal stand-in for the Hermes gateway: serves
-// the board snapshot at /api/plugins/kanban/board and upgrades the WS connection
-// at /api/plugins/kanban/events. Captures the most recent connection so the
-// test can drive events or kill it.
-type kanbanIntegrationServer struct {
-	srv       *httptest.Server
-	upgrader  websocket.Upgrader
-	connMu    sync.Mutex
-	currConn  *websocket.Conn
-	connReady chan struct{}
-	board     kanbanBoardResponse
-}
-
-func newKanbanIntegrationServer(board kanbanBoardResponse) *kanbanIntegrationServer {
-	s := &kanbanIntegrationServer{
-		board:     board,
-		connReady: make(chan struct{}, 8),
-	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/plugins/kanban/board", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(s.board)
-	})
-	mux.HandleFunc("/api/plugins/kanban/events", func(w http.ResponseWriter, r *http.Request) {
-		conn, err := s.upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		s.connMu.Lock()
-		s.currConn = conn
-		s.connMu.Unlock()
-		select {
-		case s.connReady <- struct{}{}:
-		default:
-		}
-		// Block reading until the client closes or we close it externally.
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				return
-			}
-		}
-	})
-	s.srv = httptest.NewServer(mux)
-	return s
-}
-
-func (s *kanbanIntegrationServer) URL() string { return s.srv.URL }
-
-func (s *kanbanIntegrationServer) Close() {
-	s.srv.Close()
-}
-
-// sendEvent pushes a single kanban event to the live WS client.
-func (s *kanbanIntegrationServer) sendEvent(evt kanbanEvent) error {
-	s.connMu.Lock()
-	c := s.currConn
-	s.connMu.Unlock()
-	if c == nil {
-		return nil
-	}
-	b, err := json.Marshal(evt)
+	t.Cleanup(func() { _ = d.Close() })
+	_, err = d.Exec(`
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch'
+        );
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            run_id INTEGER,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        );
+    `)
 	if err != nil {
-		return err
+		t.Fatalf("schema: %v", err)
 	}
-	return c.WriteMessage(websocket.TextMessage, b)
+	return path, d
 }
 
-func (s *kanbanIntegrationServer) killCurrentConnection() {
-	s.connMu.Lock()
-	c := s.currConn
-	s.currConn = nil
-	s.connMu.Unlock()
-	if c != nil {
-		_ = c.Close()
-	}
-}
-
-// TestKanbanWatcher_Integration_SeedAndStream drives the full lifecycle through
-// a fake gateway: seed via HTTP, stream events via WS, kill the connection,
-// verify reconnect re-seeds and seedOK clears in between.
-func TestKanbanWatcher_Integration_SeedAndStream(t *testing.T) {
-	if testing.Short() {
-		t.Skip("integration test")
-	}
-	board := kanbanBoardResponse{Tasks: []kanbanTask{{ID: "T1", Status: "running"}}}
-	gateway := newKanbanIntegrationServer(board)
-	defer gateway.Close()
-
-	w := NewKanbanWatcher(gateway.URL())
-	w.Start()
-	defer w.Stop()
-
-	// Wait for the WS client to connect (signals seed+dial both succeeded).
-	select {
-	case <-gateway.connReady:
-	case <-time.After(3 * time.Second):
-		t.Fatal("watcher did not connect within 3s")
-	}
-
-	// Seed should have set running=1 via the board snapshot.
-	if !w.IsHealthy() {
-		t.Fatal("expected IsHealthy=true after successful seed")
-	}
-	if running, _ := w.Counts(); running != 1 {
-		t.Errorf("after seed: running=%d, want 1", running)
-	}
-
-	// Push a "blocked" event for T1; counts should swap to blocked=1.
-	if err := gateway.sendEvent(kanbanEvent{ID: 10, Kind: "blocked", TaskID: "T1"}); err != nil {
-		t.Fatalf("sendEvent: %v", err)
-	}
-	if !waitForCounts(w, 0, 1, 2*time.Second) {
-		running, blocked := w.Counts()
-		t.Fatalf("after blocked event: running=%d blocked=%d, want 0 1", running, blocked)
-	}
-
-	// Kill the connection. seedOK must clear during the disconnect window and
-	// reconnect should re-seed from the (unchanged) board.
-	gateway.killCurrentConnection()
-
-	// Wait for reconnect — the new connection signals on connReady again.
-	select {
-	case <-gateway.connReady:
-	case <-time.After(5 * time.Second):
-		t.Fatal("watcher did not reconnect within 5s")
-	}
-
-	// After re-seed the running count returns to 1 (board still shows T1=running).
-	if !waitForCounts(w, 1, 0, 2*time.Second) {
-		running, blocked := w.Counts()
-		t.Fatalf("after reconnect+reseed: running=%d blocked=%d, want 1 0", running, blocked)
+// insertTask inserts a single tasks row.
+func insertTask(t *testing.T, db *sql.DB, id, status string) {
+	t.Helper()
+	_, err := db.Exec(
+		`INSERT INTO tasks (id, title, status, created_at) VALUES (?, ?, ?, ?)`,
+		id, "task "+id, status, time.Now().UnixMilli(),
+	)
+	if err != nil {
+		t.Fatalf("insert task: %v", err)
 	}
 }
 
-// TestKanbanWatcher_Integration_BoardFailureClearsHealthy verifies that a
-// failing /board endpoint causes IsHealthy() to flip false and stay false
-// until the endpoint recovers.
-func TestKanbanWatcher_Integration_BoardFailureClearsHealthy(t *testing.T) {
-	if testing.Short() {
-		t.Skip("integration test")
+// insertEvent inserts a task_events row and returns its rowid.
+func insertEvent(t *testing.T, db *sql.DB, taskID, kind string) int64 {
+	t.Helper()
+	res, err := db.Exec(
+		`INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)`,
+		taskID, kind, "{}", time.Now().UnixMilli(),
+	)
+	if err != nil {
+		t.Fatalf("insert event: %v", err)
 	}
-	var failing atomic.Bool
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/plugins/kanban/board", func(w http.ResponseWriter, r *http.Request) {
-		if failing.Load() {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(kanbanBoardResponse{})
-	})
-	mux.HandleFunc("/api/plugins/kanban/events", func(w http.ResponseWriter, r *http.Request) {
-		upg := websocket.Upgrader{}
-		conn, err := upg.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				return
-			}
-		}
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	w := NewKanbanWatcher(srv.URL)
-	w.Start()
-	defer w.Stop()
-
-	// Initially seed succeeds, watcher healthy.
-	deadline := time.Now().Add(3 * time.Second)
-	for !w.IsHealthy() && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
+	id, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("LastInsertId: %v", err)
 	}
-	if !w.IsHealthy() {
-		t.Fatal("expected IsHealthy=true after initial seed")
-	}
-
-	// Flip board to 500, force a disconnect by terminating the upstream server's
-	// WS conn. We do this indirectly: switching `failing` so the next reconnect
-	// seed fails. Trigger reconnect by closing the upstream server (Stop method
-	// not available without rewiring, so we just wait for the natural ping/pong
-	// timeout — too slow for a unit test). Instead, verify the contract on a
-	// fresh watcher pointed at the failing endpoint.
-	failing.Store(true)
-	w2 := NewKanbanWatcher(srv.URL)
-	w2.Start()
-	defer w2.Stop()
-	// Give it a brief window to attempt seed and fail.
-	time.Sleep(300 * time.Millisecond)
-	if w2.IsHealthy() {
-		t.Error("expected IsHealthy=false when /board returns 500")
-	}
+	return id
 }
 
-// waitForCounts polls Counts() until it equals (wantRunning, wantBlocked) or
-// the timeout elapses. Returns true on success.
+// waitForCounts polls Counts() until both equal the desired values or the
+// timeout elapses. Returns true on success.
 func waitForCounts(w *KanbanWatcher, wantRunning, wantBlocked int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		running, blocked := w.Counts()
-		if running == wantRunning && blocked == wantBlocked {
+		r, b := w.Counts()
+		if r == wantRunning && b == wantBlocked {
 			return true
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	return false
+}
+
+// waitForHealthy polls IsHealthy() until true or the timeout elapses.
+func waitForHealthy(w *KanbanWatcher, want bool, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if w.IsHealthy() == want {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
+}
+
+// ----------------------------------------------------------------------------
+// Construction / lifecycle
+// ----------------------------------------------------------------------------
+
+func TestKanbanWatcher_CountsStartAtZero(t *testing.T) {
+	w := NewKanbanWatcher(filepath.Join(t.TempDir(), "does-not-exist.db"))
+	r, b := w.Counts()
+	if r != 0 || b != 0 {
+		t.Fatalf("counts = (%d,%d), want (0,0)", r, b)
+	}
+}
+
+func TestKanbanWatcher_IsHealthyFalseBeforeStart(t *testing.T) {
+	w := NewKanbanWatcher(filepath.Join(t.TempDir(), "does-not-exist.db"))
+	if w.IsHealthy() {
+		t.Fatal("IsHealthy() = true before Start; want false")
+	}
+}
+
+func TestKanbanWatcher_StopIsIdempotent(t *testing.T) {
+	w := NewKanbanWatcher(filepath.Join(t.TempDir(), "does-not-exist.db"))
+	w.Stop()
+	w.Stop()
+	w.Stop()
+}
+
+func TestKanbanWatcher_StartIsIdempotent(t *testing.T) {
+	path, _ := makeTestDB(t)
+	w := NewKanbanWatcher(path)
+	w.Start()
+	w.Start()
+	w.Start()
+	defer w.Stop()
+	if !waitForHealthy(w, true, 2*time.Second) {
+		t.Fatal("watcher never became healthy")
+	}
+}
+
+// ----------------------------------------------------------------------------
+// applyEvent — state machine unit tests
+// ----------------------------------------------------------------------------
+
+func TestApplyEvent_ClaimedNewTask(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "T1"})
+	r, b := w.Counts()
+	if r != 1 || b != 0 {
+		t.Fatalf("counts = (%d,%d), want (1,0)", r, b)
+	}
+	if got := w.TaskStatus("T1"); got != "running" {
+		t.Fatalf("TaskStatus(T1) = %q, want running", got)
+	}
+}
+
+func TestApplyEvent_ClaimedAlreadyRunning(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "T1"})
+	w.applyEvent(kanbanEvent{ID: 2, Kind: "claimed", TaskID: "T1"})
+	r, b := w.Counts()
+	if r != 1 || b != 0 {
+		t.Fatalf("counts = (%d,%d), want (1,0) — no double increment", r, b)
+	}
+}
+
+func TestApplyEvent_BlockedFromRunning(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "T1"})
+	w.applyEvent(kanbanEvent{ID: 2, Kind: "blocked", TaskID: "T1"})
+	r, b := w.Counts()
+	if r != 0 || b != 1 {
+		t.Fatalf("counts = (%d,%d), want (0,1)", r, b)
+	}
+	if got := w.TaskStatus("T1"); got != "blocked" {
+		t.Fatalf("TaskStatus(T1) = %q, want blocked", got)
+	}
+}
+
+func TestApplyEvent_BlockedUnseenTask(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "blocked", TaskID: "T1"})
+	r, b := w.Counts()
+	if r != 0 || b != 1 {
+		t.Fatalf("counts = (%d,%d), want (0,1)", r, b)
+	}
+}
+
+func TestApplyEvent_BlockedAlreadyBlocked(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "blocked", TaskID: "T1"})
+	w.applyEvent(kanbanEvent{ID: 2, Kind: "blocked", TaskID: "T1"})
+	r, b := w.Counts()
+	if r != 0 || b != 1 {
+		t.Fatalf("counts = (%d,%d), want (0,1) — no double increment", r, b)
+	}
+}
+
+func TestApplyEvent_UnblockedFromBlocked(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "blocked", TaskID: "T1"})
+	w.applyEvent(kanbanEvent{ID: 2, Kind: "unblocked", TaskID: "T1"})
+	r, b := w.Counts()
+	if r != 1 || b != 0 {
+		t.Fatalf("counts = (%d,%d), want (1,0)", r, b)
+	}
+	if got := w.TaskStatus("T1"); got != "running" {
+		t.Fatalf("TaskStatus(T1) = %q, want running", got)
+	}
+}
+
+func TestApplyEvent_UnblockedFromRunningIsNoop(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "T1"})
+	w.applyEvent(kanbanEvent{ID: 2, Kind: "unblocked", TaskID: "T1"})
+	r, b := w.Counts()
+	if r != 1 || b != 0 {
+		t.Fatalf("counts = (%d,%d), want (1,0) — stale unblocked is no-op", r, b)
+	}
+}
+
+func TestApplyEvent_UnblockedUnseenIsNoop(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "unblocked", TaskID: "T1"})
+	r, b := w.Counts()
+	if r != 0 || b != 0 {
+		t.Fatalf("counts = (%d,%d), want (0,0) — unseen unblocked is no-op", r, b)
+	}
+}
+
+func TestApplyEvent_ReclaimedFromBlocked(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "blocked", TaskID: "T1"})
+	w.applyEvent(kanbanEvent{ID: 2, Kind: "reclaimed", TaskID: "T1"})
+	r, b := w.Counts()
+	if r != 1 || b != 0 {
+		t.Fatalf("counts = (%d,%d), want (1,0)", r, b)
+	}
+}
+
+func TestApplyEvent_ReclaimedFromRunningIsNoop(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "T1"})
+	w.applyEvent(kanbanEvent{ID: 2, Kind: "reclaimed", TaskID: "T1"})
+	r, b := w.Counts()
+	if r != 1 || b != 0 {
+		t.Fatalf("counts = (%d,%d), want (1,0) — already-running reclaim is no-op", r, b)
+	}
+}
+
+func TestApplyEvent_ReclaimedUnseenIncrementsRunning(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "reclaimed", TaskID: "T1"})
+	r, b := w.Counts()
+	if r != 1 || b != 0 {
+		t.Fatalf("counts = (%d,%d), want (1,0)", r, b)
+	}
+}
+
+func TestApplyEvent_TerminalKindsDecrementRunning(t *testing.T) {
+	for _, kind := range []string{"completed", "archived", "crashed", "timed_out", "gave_up"} {
+		t.Run(kind, func(t *testing.T) {
+			w := NewKanbanWatcher("ignored")
+			w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "T1"})
+			w.applyEvent(kanbanEvent{ID: 2, Kind: kind, TaskID: "T1"})
+			r, b := w.Counts()
+			if r != 0 || b != 0 {
+				t.Fatalf("counts = (%d,%d), want (0,0)", r, b)
+			}
+			if got := w.TaskStatus("T1"); got != "" {
+				t.Fatalf("TaskStatus(T1) = %q, want empty", got)
+			}
+		})
+	}
+}
+
+func TestApplyEvent_CompletedFromBlockedDecrementsBlocked(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "blocked", TaskID: "T1"})
+	w.applyEvent(kanbanEvent{ID: 2, Kind: "completed", TaskID: "T1"})
+	r, b := w.Counts()
+	if r != 0 || b != 0 {
+		t.Fatalf("counts = (%d,%d), want (0,0)", r, b)
+	}
+}
+
+func TestApplyEvent_CompletedUnseenIsNoop(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "completed", TaskID: "T1"})
+	r, b := w.Counts()
+	if r != 0 || b != 0 {
+		t.Fatalf("counts = (%d,%d), want (0,0)", r, b)
+	}
+}
+
+func TestApplyEvent_DuplicateEventIgnored(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	w.applyEvent(kanbanEvent{ID: 5, Kind: "claimed", TaskID: "T1"})
+	// Same id replayed — cursor already at 5, so this must be ignored even
+	// though logically the kind would otherwise be a no-op anyway. Replay
+	// with a count-changing kind to make the assertion sharp.
+	w.applyEvent(kanbanEvent{ID: 5, Kind: "blocked", TaskID: "T1"})
+	r, b := w.Counts()
+	if r != 1 || b != 0 {
+		t.Fatalf("counts = (%d,%d), want (1,0) — duplicate id must be ignored", r, b)
+	}
+}
+
+func TestApplyEvent_LowerIDIgnored(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	w.applyEvent(kanbanEvent{ID: 10, Kind: "claimed", TaskID: "T1"})
+	w.applyEvent(kanbanEvent{ID: 3, Kind: "blocked", TaskID: "T1"})
+	r, b := w.Counts()
+	if r != 1 || b != 0 {
+		t.Fatalf("counts = (%d,%d), want (1,0) — out-of-order id below cursor must be ignored", r, b)
+	}
+}
+
+func TestApplyEvent_AdvancesCursor(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	w.applyEvent(kanbanEvent{ID: 7, Kind: "claimed", TaskID: "T1"})
+	w.mu.RLock()
+	got := w.cursor
+	w.mu.RUnlock()
+	if got != 7 {
+		t.Fatalf("cursor = %d, want 7", got)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Counts never go negative under pathological input
+// ----------------------------------------------------------------------------
+
+func TestApplyEvent_CountsNeverNegative(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+
+	// Terminate tasks that were never seen — must not push counters negative.
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "completed", TaskID: "ghost-1"})
+	w.applyEvent(kanbanEvent{ID: 2, Kind: "archived", TaskID: "ghost-2"})
+	w.applyEvent(kanbanEvent{ID: 3, Kind: "crashed", TaskID: "ghost-3"})
+	w.applyEvent(kanbanEvent{ID: 4, Kind: "timed_out", TaskID: "ghost-4"})
+	w.applyEvent(kanbanEvent{ID: 5, Kind: "gave_up", TaskID: "ghost-5"})
+	w.applyEvent(kanbanEvent{ID: 6, Kind: "unblocked", TaskID: "ghost-6"})
+
+	r, b := w.Counts()
+	if r != 0 {
+		t.Fatalf("running = %d, want 0", r)
+	}
+	if b != 0 {
+		t.Fatalf("blocked = %d, want 0", b)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Subscribe / Unsubscribe behavior
+// ----------------------------------------------------------------------------
+
+func TestSubscribe_ReceivesNotificationOnChange(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	ch := w.Subscribe()
+
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "T1"})
+
+	select {
+	case <-ch:
+		// good
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("subscriber did not receive notification within 200ms")
+	}
+}
+
+func TestUnsubscribe_StopsDelivery(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	ch := w.Subscribe()
+	w.Unsubscribe(ch)
+
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "T1"})
+
+	select {
+	case <-ch:
+		t.Fatal("unsubscribed channel still received notification")
+	default:
+		// good
+	}
+}
+
+func TestSubscribe_SecondSubscriberStillReceives(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	chA := w.Subscribe()
+	chB := w.Subscribe()
+	w.Unsubscribe(chA)
+
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "T1"})
+
+	select {
+	case <-chB:
+		// good
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("remaining subscriber did not receive notification")
+	}
+
+	// chA should still not see anything.
+	select {
+	case <-chA:
+		t.Fatal("unsubscribed channel A unexpectedly received notification")
+	default:
+	}
+}
+
+func TestSubscribe_NoNotifyWhenCountsUnchanged(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	// Pre-claim so the second claimed event is a no-op.
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "T1"})
+
+	ch := w.Subscribe()
+	w.applyEvent(kanbanEvent{ID: 2, Kind: "claimed", TaskID: "T1"}) // no change
+
+	select {
+	case <-ch:
+		t.Fatal("subscriber received notification despite no count change")
+	case <-time.After(100 * time.Millisecond):
+		// good
+	}
+}
+
+func TestDroppedNotifications_IncrementsWhenSubscriberFull(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	ch := w.Subscribe()
+
+	// First event fills the buffer (cap 1).
+	w.applyEvent(kanbanEvent{ID: 1, Kind: "claimed", TaskID: "T1"})
+	// Second count-changing event finds the channel already full → dropped.
+	w.applyEvent(kanbanEvent{ID: 2, Kind: "blocked", TaskID: "T1"})
+	// Third count-changing event also dropped (we never drained).
+	w.applyEvent(kanbanEvent{ID: 3, Kind: "unblocked", TaskID: "T1"})
+
+	if got := w.DroppedNotifications(); got < 2 {
+		t.Fatalf("DroppedNotifications() = %d, want >= 2", got)
+	}
+	// Drain so the test goroutine doesn't leak references; nothing more to assert.
+	select {
+	case <-ch:
+	default:
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Integration test: real SQLite file driven by NewKanbanWatcher.Start()
+// ----------------------------------------------------------------------------
+
+func TestKanbanWatcher_Integration_SeedsAndTailsEvents(t *testing.T) {
+	path, db := makeTestDB(t)
+
+	// Seed: T1 running, T2 claimed (also counts as running), T3 blocked, T4 done (ignored).
+	insertTask(t, db, "T1", "running")
+	insertTask(t, db, "T2", "claimed")
+	insertTask(t, db, "T3", "blocked")
+	insertTask(t, db, "T4", "done")
+
+	w := NewKanbanWatcher(path)
+
+	// Subscribe BEFORE any insert to avoid races; this channel should fire when
+	// the new task_events row is observed.
+	sub := w.Subscribe()
+
+	w.Start()
+	defer w.Stop()
+
+	if !waitForHealthy(w, true, 2*time.Second) {
+		t.Fatal("watcher never became healthy")
+	}
+
+	// Initial counts: T1 + T2 running, T3 blocked.
+	if !waitForCounts(w, 2, 1, 2*time.Second) {
+		r, b := w.Counts()
+		t.Fatalf("initial counts = (%d,%d), want (2,1)", r, b)
+	}
+	if got := w.TaskStatus("T1"); got != "running" {
+		t.Errorf("TaskStatus(T1) = %q, want running", got)
+	}
+	if got := w.TaskStatus("T3"); got != "blocked" {
+		t.Errorf("TaskStatus(T3) = %q, want blocked", got)
+	}
+
+	// The seed itself might have notified once if counts changed from zero
+	// (they did). Drain any pending signal so the next assertion is sharp.
+	select {
+	case <-sub:
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Append a "blocked" event for T1 (which is currently running).
+	insertEvent(t, db, "T1", "blocked")
+
+	// Expected: running 2→1, blocked 1→2.
+	if !waitForCounts(w, 1, 2, 2*time.Second) {
+		r, b := w.Counts()
+		t.Fatalf("post-event counts = (%d,%d), want (1,2)", r, b)
+	}
+
+	// Subscriber should have been signaled.
+	select {
+	case <-sub:
+		// good
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscriber never received notification for new event")
+	}
+
+	if got := w.TaskStatus("T1"); got != "blocked" {
+		t.Errorf("after event, TaskStatus(T1) = %q, want blocked", got)
+	}
+}
+
+func TestKanbanWatcher_Integration_StopClosesSubscribers(t *testing.T) {
+	path, _ := makeTestDB(t)
+
+	w := NewKanbanWatcher(path)
+	w.Start()
+	if !waitForHealthy(w, true, 2*time.Second) {
+		w.Stop()
+		t.Fatal("watcher never became healthy")
+	}
+	sub := w.Subscribe()
+
+	w.Stop()
+
+	// Reading from a closed channel returns immediately with the zero value
+	// and ok=false. We just need the read to unblock within a reasonable time.
+	select {
+	case _, ok := <-sub:
+		if ok {
+			// A pre-close notification is fine, but the channel must then close;
+			// read once more to confirm.
+			select {
+			case _, ok2 := <-sub:
+				if ok2 {
+					t.Fatal("subscriber channel did not close after Stop()")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("subscriber channel did not close after Stop()")
+			}
+		}
+	case <-time.After(time.Second):
+		t.Fatal("subscriber channel did not close after Stop()")
+	}
+}
+
+// ----------------------------------------------------------------------------
+// IsHealthy lifecycle
+// ----------------------------------------------------------------------------
+
+func TestKanbanWatcher_IsHealthy_FalseWhenDBMissing(t *testing.T) {
+	// Point at a path that doesn't exist; seed will fail every time.
+	path := filepath.Join(t.TempDir(), "missing.db")
+	w := NewKanbanWatcher(path)
+	w.Start()
+	defer w.Stop()
+
+	// Give the poll loop a moment to attempt and fail to seed.
+	time.Sleep(300 * time.Millisecond)
+	if w.IsHealthy() {
+		t.Fatal("IsHealthy() = true when db file is missing; want false")
+	}
+}
+
+func TestKanbanWatcher_IsHealthy_TrueAfterSeed(t *testing.T) {
+	path, _ := makeTestDB(t)
+	w := NewKanbanWatcher(path)
+	w.Start()
+	defer w.Stop()
+
+	if !waitForHealthy(w, true, 2*time.Second) {
+		t.Fatal("watcher never became healthy with a valid db")
+	}
+}
+
+func TestKanbanWatcher_Seed_DirectCall(t *testing.T) {
+	path, db := makeTestDB(t)
+	insertTask(t, db, "T1", "running")
+	insertTask(t, db, "T2", "blocked")
+	// Pre-existing event so the cursor advances at seed.
+	cursorID := insertEvent(t, db, "T1", "claimed")
+
+	w := NewKanbanWatcher(path)
+	if err := w.seed(); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	r, b := w.Counts()
+	if r != 1 || b != 1 {
+		t.Fatalf("counts after seed = (%d,%d), want (1,1)", r, b)
+	}
+	if !w.IsHealthy() {
+		t.Fatal("IsHealthy() = false after successful seed; want true")
+	}
+
+	// Cursor should equal the max task_events.id observed.
+	w.mu.RLock()
+	gotCursor := w.cursor
+	w.mu.RUnlock()
+	if gotCursor != cursorID {
+		t.Fatalf("cursor after seed = %d, want %d", gotCursor, cursorID)
+	}
+}
+
+func TestKanbanWatcher_Seed_FailsWhenFileMissing(t *testing.T) {
+	w := NewKanbanWatcher(filepath.Join(t.TempDir(), "nope.db"))
+	if err := w.seed(); err == nil {
+		t.Fatal("seed() returned nil error for missing file; want error")
+	}
+	if w.IsHealthy() {
+		t.Fatal("IsHealthy() = true after failed seed; want false")
+	}
 }

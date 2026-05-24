@@ -2,112 +2,93 @@ package session
 
 import (
 	"context"
-	"encoding/json"
+	"database/sql"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
-	"strings"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
+	_ "modernc.org/sqlite"
 
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 )
 
-var kanbanLog = logging.ForComponent("hermes-kanban")
-
-const (
-	kanbanInitialBackoff = 1 * time.Second
-	kanbanMaxBackoff     = 30 * time.Second
-	kanbanBackoffFactor  = 2
-
-	// kanbanWSReadLimit bounds a single WebSocket frame the gateway can push.
-	// Same 1 MB cap used by seedCounts for the HTTP board endpoint.
-	kanbanWSReadLimit = 1 << 20
-
-	// kanbanReadTimeout is how long readEvents will wait between frames or pong
-	// responses before declaring the connection half-open and forcing a reconnect.
-	kanbanReadTimeout = 60 * time.Second
-
-	// kanbanPingInterval is how often we send a ping while the WS is idle.
-	// Must be < kanbanReadTimeout so a pong can reset the deadline in time.
-	kanbanPingInterval = 25 * time.Second
-)
-
-// kanbanSeedClient is shared across all seedCounts calls so TCP connection
-// reuse and TLS session caching survive reconnects.
-var kanbanSeedClient = &http.Client{Timeout: 10 * time.Second}
-
-// kanbanEvent is the minimal shape of a Hermes Kanban WebSocket event.
-type kanbanEvent struct {
-	ID     int64  `json:"id"`
-	Kind   string `json:"kind"`
-	TaskID string `json:"task_id"`
-}
-
-// kanbanBoardResponse is used to seed initial counts from the HTTP board endpoint.
-type kanbanBoardResponse struct {
-	Tasks []kanbanTask `json:"tasks"`
-}
-
-type kanbanTask struct {
-	ID     string `json:"id"`
-	Status string `json:"status"`
-}
-
-// KanbanWatcher maintains a live count of running/blocked Kanban tasks
-// by streaming events from the Hermes gateway WebSocket endpoint.
-// Falls back gracefully when the gateway is unreachable.
+// KanbanWatcher reads Hermes Kanban state directly from ~/.hermes/kanban.db,
+// the same SQLite file the Hermes CLI, dashboard plugin, and gateway notifier
+// all read from. It does NOT speak HTTP or WebSocket — the dashboard plugin's
+// own /events WebSocket is itself just a poll-and-relay over this same table.
+// Reading directly removes a network hop, an authentication dependency, and a
+// process dependency (the dashboard does not need to be running).
+//
+// The watcher seeds counts from the `tasks` table and then tails the
+// append-only `task_events` table on a short interval, applying each event
+// through the same state machine the prior WebSocket watcher used.
 type KanbanWatcher struct {
-	gatewayURL string
+	dbPath string
 
 	mu           sync.RWMutex
 	running      int
 	blocked      int
 	taskStatuses map[string]string
-	seedOK       bool // true after at least one successful seedCounts
-
-	lastEventID int64
+	cursor       int64 // last-seen task_events.id
+	seedOK       bool
 
 	stopCh    chan struct{}
 	stopOnce  sync.Once
 	startOnce sync.Once
-	subsMu    sync.Mutex
-	subs      []chan struct{}
 
-	// droppedNotifications counts notify() calls where a subscriber's buffered
-	// channel was already full — i.e. the subscriber didn't drain in time.
-	// Exposed via DroppedNotifications() for observability.
+	subsMu sync.Mutex
+	subs   []chan struct{}
+
 	droppedNotifications atomic.Int64
 }
 
-// NewKanbanWatcher creates a new KanbanWatcher for the given gateway URL.
-// The URL should be the HTTP/WS base URL of the Hermes gateway
-// (e.g. "http://127.0.0.1:8080" or "ws://127.0.0.1:8080").
-func NewKanbanWatcher(gatewayURL string) *KanbanWatcher {
+var kanbanLog = logging.ForComponent("hermes-kanban")
+
+const (
+	// kanbanDBPollInterval determines the maximum latency between a Hermes
+	// state change and an agent-deck badge update. 500ms gives sub-second UX
+	// while keeping the SQLite read cost negligible (one indexed range query).
+	kanbanDBPollInterval = 500 * time.Millisecond
+
+	// kanbanReseedInterval is the maximum time between full re-seeds from the
+	// `tasks` table. Re-seeding bounds drift from missed or out-of-order events
+	// (defense in depth — the state machine should already converge).
+	kanbanReseedInterval = 5 * time.Minute
+)
+
+// kanbanEvent mirrors the relevant columns of the task_events row.
+type kanbanEvent struct {
+	ID     int64
+	Kind   string
+	TaskID string
+}
+
+// NewKanbanWatcher constructs a watcher rooted at the given SQLite file.
+// The file does not need to exist yet; Start will fall into a retry loop and
+// IsHealthy() will report false until the first successful seed.
+func NewKanbanWatcher(dbPath string) *KanbanWatcher {
 	return &KanbanWatcher{
-		gatewayURL:   gatewayURL,
+		dbPath:       dbPath,
 		taskStatuses: make(map[string]string),
 		stopCh:       make(chan struct{}),
 	}
 }
 
-// Start runs the reconnect loop in a goroutine. Idempotent — safe to call multiple times.
+// Start launches the poll loop in a background goroutine. Idempotent.
 func (w *KanbanWatcher) Start() {
 	w.startOnce.Do(func() {
-		go w.reconnectLoop()
+		go w.pollLoop()
 	})
 }
 
-// Stop signals the watcher to stop and closes all subscriber channels so
-// goroutines blocked in listenForKanbanUpdates unblock immediately. Idempotent.
+// Stop signals the poll loop to exit and closes all subscriber channels so
+// goroutines blocked on the subscription return. Idempotent.
 func (w *KanbanWatcher) Stop() {
 	w.stopOnce.Do(func() {
 		close(w.stopCh)
-		// Close subscriber channels so any goroutine blocked on <-ch returns.
 		w.subsMu.Lock()
 		for _, ch := range w.subs {
 			close(ch)
@@ -118,15 +99,14 @@ func (w *KanbanWatcher) Stop() {
 }
 
 // Counts returns the current running and blocked task counts.
-// Always instant — reads from in-memory state protected by RWMutex.
 func (w *KanbanWatcher) Counts() (running, blocked int) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	return w.running, w.blocked
 }
 
-// TaskStatus returns the current status of a specific task by ID.
-// Returns "running", "blocked", or "" (not found / terminal state).
+// TaskStatus returns "running", "blocked", or "" (terminal / unknown) for the
+// given task ID.
 func (w *KanbanWatcher) TaskStatus(id string) string {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
@@ -136,8 +116,9 @@ func (w *KanbanWatcher) TaskStatus(id string) string {
 	return w.taskStatuses[id]
 }
 
-// IsHealthy returns true if the watcher has successfully seeded from the gateway
-// at least once. When false, callers should fall back to CLI polling.
+// IsHealthy reports whether the watcher has successfully seeded from the
+// kanban.db at least once. Callers should fall back to CLI polling when this
+// returns false.
 func (w *KanbanWatcher) IsHealthy() bool {
 	if w == nil {
 		return false
@@ -147,9 +128,9 @@ func (w *KanbanWatcher) IsHealthy() bool {
 	return w.seedOK
 }
 
-// Subscribe returns a channel that receives an empty struct whenever the
-// running or blocked count changes. The channel is buffered (capacity 1);
-// slow consumers miss coalesced updates but never block the watcher.
+// Subscribe returns a buffered channel that receives a signal whenever counts
+// change. Capacity 1; slow consumers see coalesced updates but never block
+// the watcher. Call Unsubscribe to release the channel when finished.
 func (w *KanbanWatcher) Subscribe() <-chan struct{} {
 	ch := make(chan struct{}, 1)
 	w.subsMu.Lock()
@@ -158,9 +139,31 @@ func (w *KanbanWatcher) Subscribe() <-chan struct{} {
 	return ch
 }
 
-// notify sends to all subscriber channels (non-blocking). When a channel's
-// buffer is full the notification is coalesced (the subscriber will see one
-// signal when it drains) and droppedNotifications is incremented.
+// Unsubscribe removes ch from the subscriber list. Safe to call even if ch
+// was never subscribed (no-op).
+func (w *KanbanWatcher) Unsubscribe(ch <-chan struct{}) {
+	w.subsMu.Lock()
+	for i, c := range w.subs {
+		if c == ch {
+			w.subs = append(w.subs[:i], w.subs[i+1:]...)
+			break
+		}
+	}
+	w.subsMu.Unlock()
+}
+
+// DroppedNotifications returns how many subscriber sends were coalesced
+// because the consumer's buffer was full.
+func (w *KanbanWatcher) DroppedNotifications() int64 {
+	if w == nil {
+		return 0
+	}
+	return w.droppedNotifications.Load()
+}
+
+// notify signals every subscriber. Non-blocking: if a channel's buffer is
+// full, the notification is dropped (coalesced) and droppedNotifications
+// increments.
 func (w *KanbanWatcher) notify() {
 	w.subsMu.Lock()
 	defer w.subsMu.Unlock()
@@ -173,49 +176,11 @@ func (w *KanbanWatcher) notify() {
 	}
 }
 
-// DroppedNotifications returns how many subscriber sends were coalesced because
-// the consumer's buffer was full. Useful for diagnosing slow consumers.
-func (w *KanbanWatcher) DroppedNotifications() int64 {
-	if w == nil {
-		return 0
-	}
-	return w.droppedNotifications.Load()
-}
-
-// setCountsAndStatusesAndNotify updates counts and the per-task status map atomically.
-// When markSeedOK is true, seedOK is set to true inside the same lock so IsHealthy()
-// never returns true while counts are still stale.
-func (w *KanbanWatcher) setCountsAndStatusesAndNotify(running, blocked int, statuses map[string]string, markSeedOK bool) {
-	w.mu.Lock()
-	changed := w.running != running || w.blocked != blocked
-	if markSeedOK {
-		w.seedOK = true
-	}
-	w.running = running
-	w.blocked = blocked
-	w.taskStatuses = statuses
-	w.mu.Unlock()
-	if changed {
-		w.notify()
-	}
-}
-
-// Unsubscribe removes ch from the subscriber list. Call after the channel has
-// fired to prevent dead channels from accumulating in w.subs indefinitely.
-func (w *KanbanWatcher) Unsubscribe(ch <-chan struct{}) {
-	w.subsMu.Lock()
-	for i, c := range w.subs {
-		if c == ch {
-			w.subs = append(w.subs[:i], w.subs[i+1:]...)
-			break
-		}
-	}
-	w.subsMu.Unlock()
-}
-
-// reconnectLoop dials WebSocket, reads events, and reconnects on disconnect.
-func (w *KanbanWatcher) reconnectLoop() {
-	backoff := kanbanInitialBackoff
+// pollLoop is the main goroutine. It seeds from the tasks table, then on each
+// tick fetches new events from task_events. It re-seeds every kanbanReseedInterval
+// to bound any drift the state machine might accumulate.
+func (w *KanbanWatcher) pollLoop() {
+	lastSeed := time.Time{}
 	for {
 		select {
 		case <-w.stopCh:
@@ -223,272 +188,216 @@ func (w *KanbanWatcher) reconnectLoop() {
 		default:
 		}
 
-		established, err := w.runSession()
-		if err == nil {
-			// Clean disconnect (Stop called); exit without retrying.
-			return
+		// (Re)seed when we've never seeded, or the reseed interval elapsed.
+		if time.Since(lastSeed) > kanbanReseedInterval {
+			if err := w.seed(); err != nil {
+				w.markUnhealthy()
+				kanbanLog.Debug("kanban_db_seed_failed", slog.String("error", err.Error()))
+				// Wait before retry; back off a little but stay responsive.
+				select {
+				case <-w.stopCh:
+					return
+				case <-time.After(2 * time.Second):
+				}
+				continue
+			}
+			lastSeed = time.Now()
 		}
 
-		// Clear health so GetHermesKanbanCounts falls back to CLI polling
-		// until the next successful seed — prevents serving stale watcher data.
-		w.mu.Lock()
-		w.seedOK = false
-		w.mu.Unlock()
-
-		// Reset backoff only when this session was fully established (past WS
-		// dial). A failed seed or dial should keep accumulating backoff.
-		if established {
-			backoff = kanbanInitialBackoff
+		// Poll for new events.
+		if err := w.fetchNewEvents(); err != nil {
+			kanbanLog.Debug("kanban_db_poll_failed", slog.String("error", err.Error()))
+			// Don't mark unhealthy on a transient poll error — the next seed
+			// will either succeed (resync) or fail loudly.
 		}
-		kanbanLog.Debug("kanban_watcher_disconnected",
-			slog.String("error", err.Error()),
-			slog.Duration("backoff", backoff),
-		)
 
-		// Exponential backoff before retry
 		select {
 		case <-w.stopCh:
 			return
-		case <-time.After(backoff):
-		}
-		backoff *= kanbanBackoffFactor
-		if backoff > kanbanMaxBackoff {
-			backoff = kanbanMaxBackoff
+		case <-time.After(kanbanDBPollInterval):
 		}
 	}
 }
 
-// runSession connects, seeds counts, reads events, returns on disconnect or error.
-// established is true when the WebSocket connection was successfully opened;
-// callers use this to decide whether to reset reconnect backoff.
-func (w *KanbanWatcher) runSession() (established bool, err error) {
-	ctx, cancel := context.WithCancel(context.Background())
+// openDB opens the SQLite file read-only with a short busy timeout. WAL mode
+// is set on the file by whoever writes to it (Hermes); opening read-only does
+// not require us to set it. The query string keeps the connection lightweight.
+func (w *KanbanWatcher) openDB() (*sql.DB, error) {
+	if _, err := os.Stat(w.dbPath); err != nil {
+		return nil, fmt.Errorf("kanban.db not present: %w", err)
+	}
+	// mode=ro: read-only open; doesn't create the file.
+	// _pragma=busy_timeout: wait briefly if the writer is mid-transaction.
+	dsn := "file:" + w.dbPath + "?mode=ro&_pragma=busy_timeout(2000)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open kanban.db: %w", err)
+	}
+	return db, nil
+}
+
+// seed reads the current task snapshot and the high-water-mark from
+// task_events.id, replacing in-memory state in one atomic update.
+func (w *KanbanWatcher) seed() error {
+	db, err := w.openDB()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	// Stop context when watcher is stopped
-	go func() {
-		select {
-		case <-w.stopCh:
-			cancel()
-		case <-ctx.Done():
+	statuses := make(map[string]string)
+	var running, blocked int
+
+	rows, err := db.QueryContext(ctx, `SELECT id, status FROM tasks`)
+	if err != nil {
+		return fmt.Errorf("query tasks: %w", err)
+	}
+	for rows.Next() {
+		var id, status string
+		if err := rows.Scan(&id, &status); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan task row: %w", err)
 		}
-	}()
-
-	// Seed initial counts and per-task statuses via HTTP board endpoint.
-	running, blocked, statuses, err := w.seedCounts(ctx)
-	if err != nil {
-		return false, fmt.Errorf("seed counts: %w", err)
-	}
-	w.setCountsAndStatusesAndNotify(running, blocked, statuses, true)
-
-	// Build WebSocket URL
-	wsURL := w.buildWSURL()
-
-	// Retrieve last event ID under lock for the query param
-	w.mu.RLock()
-	lastID := w.lastEventID
-	w.mu.RUnlock()
-
-	if lastID > 0 {
-		wsURL = fmt.Sprintf("%s?since=%d", wsURL, lastID)
-	}
-
-	dialer := websocket.DefaultDialer
-	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
-	if err != nil {
-		return false, fmt.Errorf("websocket dial: %w", err)
-	}
-	defer func() { _ = conn.Close() }()
-
-	// Bound frame size, install a read deadline, and refresh the deadline on
-	// every pong. Without these, a half-open connection (NAT timeout, LB idle
-	// reaper, power-cycled switch) silently wedges readEvents forever while
-	// IsHealthy() keeps returning true — the worst failure class.
-	conn.SetReadLimit(kanbanWSReadLimit)
-	_ = conn.SetReadDeadline(time.Now().Add(kanbanReadTimeout))
-	conn.SetPongHandler(func(string) error {
-		return conn.SetReadDeadline(time.Now().Add(kanbanReadTimeout))
-	})
-
-	kanbanLog.Debug("kanban_watcher_connected", slog.String("url", wsURL))
-
-	// Send pings on an idle interval so the pong handler keeps refreshing the
-	// read deadline. Exits when readEvents returns or stopCh fires.
-	pingDone := make(chan struct{})
-	go func() {
-		t := time.NewTicker(kanbanPingInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-pingDone:
-				return
-			case <-w.stopCh:
-				return
-			case <-t.C:
-				deadline := time.Now().Add(10 * time.Second)
-				if err := conn.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
-					return
-				}
-			}
-		}
-	}()
-
-	readDone := make(chan error, 1)
-	go func() {
-		readDone <- w.readEvents(conn)
-	}()
-
-	select {
-	case <-w.stopCh:
-		close(pingDone)
-		_ = conn.Close()
-		return true, nil
-	case err := <-readDone:
-		close(pingDone)
-		return true, err
-	}
-}
-
-// seedCounts fetches the current board state via HTTP and returns running/blocked
-// counts along with a per-task status map.
-func (w *KanbanWatcher) seedCounts(ctx context.Context) (running, blocked int, statuses map[string]string, err error) {
-	boardURL := w.buildHTTPURL() + "/api/plugins/kanban/board?include_archived=false"
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, boardURL, nil)
-	if err != nil {
-		return 0, 0, nil, fmt.Errorf("build request: %w", err)
-	}
-
-	resp, err := kanbanSeedClient.Do(req)
-	if err != nil {
-		return 0, 0, nil, fmt.Errorf("http get board: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return 0, 0, nil, fmt.Errorf("board endpoint returned %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MB cap
-	if err != nil {
-		return 0, 0, nil, fmt.Errorf("read body: %w", err)
-	}
-
-	var board kanbanBoardResponse
-	if err := json.Unmarshal(body, &board); err != nil {
-		return 0, 0, nil, fmt.Errorf("unmarshal board: %w", err)
-	}
-
-	statuses = make(map[string]string)
-	for _, t := range board.Tasks {
-		switch t.Status {
+		switch status {
 		case "running", "claimed":
 			running++
-			if t.ID != "" {
-				statuses[t.ID] = "running"
+			if id != "" {
+				statuses[id] = "running"
 			}
 		case "blocked":
 			blocked++
-			if t.ID != "" {
-				statuses[t.ID] = "blocked"
+			if id != "" {
+				statuses[id] = "blocked"
 			}
 		}
 	}
-	return running, blocked, statuses, nil
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate tasks: %w", err)
+	}
+	rows.Close()
+
+	var cursor int64
+	if err := db.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(id), 0) FROM task_events`).Scan(&cursor); err != nil {
+		return fmt.Errorf("query high-water mark: %w", err)
+	}
+
+	w.applySeed(running, blocked, statuses, cursor)
+	return nil
 }
 
-// readEvents reads WebSocket messages and updates counts.
-func (w *KanbanWatcher) readEvents(conn *websocket.Conn) error {
-	for {
-		_, msg, err := conn.ReadMessage()
-		if err != nil {
-			return fmt.Errorf("read message: %w", err)
-		}
-
-		var evt kanbanEvent
-		if err := json.Unmarshal(msg, &evt); err != nil {
-			kanbanLog.Debug("kanban_event_unmarshal_failed",
-				slog.String("error", err.Error()),
-				slog.String("raw", string(msg)),
-			)
-			continue
-		}
-
-		w.applyEvent(evt)
+// applySeed installs the seeded state under a single lock, marks the watcher
+// healthy, and notifies subscribers if counts changed.
+func (w *KanbanWatcher) applySeed(running, blocked int, statuses map[string]string, cursor int64) {
+	w.mu.Lock()
+	changed := w.running != running || w.blocked != blocked
+	w.running = running
+	w.blocked = blocked
+	w.taskStatuses = statuses
+	w.cursor = cursor
+	w.seedOK = true
+	w.mu.Unlock()
+	if changed {
+		w.notify()
 	}
 }
 
-// applyEvent updates in-memory counts and per-task status based on the event kind.
+// markUnhealthy clears seedOK so IsHealthy() returns false and the UI falls
+// back to the CLI poll. Existing counts remain so the UI shows stale-but-known
+// values rather than zero.
+func (w *KanbanWatcher) markUnhealthy() {
+	w.mu.Lock()
+	w.seedOK = false
+	w.mu.Unlock()
+}
+
+// fetchNewEvents pulls task_events with id > cursor and applies each through
+// applyEvent. Cursor advances inside applyEvent.
+func (w *KanbanWatcher) fetchNewEvents() error {
+	w.mu.RLock()
+	cursor := w.cursor
+	w.mu.RUnlock()
+
+	db, err := w.openDB()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	rows, err := db.QueryContext(ctx,
+		`SELECT id, task_id, kind FROM task_events WHERE id > ? ORDER BY id ASC LIMIT 1000`,
+		cursor)
+	if err != nil {
+		return fmt.Errorf("query events: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var evt kanbanEvent
+		if err := rows.Scan(&evt.ID, &evt.TaskID, &evt.Kind); err != nil {
+			return fmt.Errorf("scan event: %w", err)
+		}
+		w.applyEvent(evt)
+	}
+	return rows.Err()
+}
+
+// applyEvent updates in-memory counts and per-task status based on the event
+// kind. Mirrors the state machine the prior WebSocket watcher used; the
+// transition rules are identical because the events are identical (same
+// task_events table, same `kind` strings).
 func (w *KanbanWatcher) applyEvent(evt kanbanEvent) {
 	w.mu.Lock()
 
-	// Skip replayed/duplicate events to prevent count drift.
-	// The ?since= query param reduces duplicates but does not eliminate them.
-	if evt.ID > 0 && evt.ID <= w.lastEventID {
+	// Guard against re-application on the cold path (test code or a
+	// future re-seed-during-poll race).
+	if evt.ID > 0 && evt.ID <= w.cursor {
 		w.mu.Unlock()
 		return
 	}
 
 	running := w.running
 	blocked := w.blocked
-
-	// prev is the task's current tracked status (empty if unseen/terminal).
 	prev := w.taskStatuses[evt.TaskID]
 
 	switch evt.Kind {
 	case "claimed":
-		// Only count if the task wasn't already tracked as active — prevents
-		// double-counting if a claimed event is delivered after a reconnect seed.
 		if prev == "" && evt.TaskID != "" {
 			running++
 			w.taskStatuses[evt.TaskID] = "running"
-		} else if evt.TaskID == "" {
-			running++
 		}
 	case "blocked":
 		if evt.TaskID != "" {
 			switch prev {
 			case "running":
-				// Transition running→blocked: swap counters.
 				if running > 0 {
 					running--
 				}
 				blocked++
 			case "blocked":
-				// Already blocked — no-op on counts.
+				// Already blocked — no-op.
 			default:
-				// Newly blocked (unseen task).
 				blocked++
 			}
 			w.taskStatuses[evt.TaskID] = "blocked"
-		} else {
-			blocked++
 		}
 	case "unblocked":
-		if evt.TaskID != "" {
-			switch prev {
-			case "blocked":
-				// Transition blocked→running: swap counters.
-				if blocked > 0 {
-					blocked--
-				}
-				running++
-				w.taskStatuses[evt.TaskID] = "running"
-			// "running" or "" — no prior blocked state to transition from; ignore.
-			// An unseen task appearing as "unblocked" is a stale or out-of-order
-			// event; the seed would have captured its current state already.
-			}
-		} else {
-			// No task ID: swap counters only if we actually had a blocked task
-			// to move. Without this guard, an "unblocked" event arriving when
-			// blocked==0 would phantom-increment running.
+		if evt.TaskID != "" && prev == "blocked" {
 			if blocked > 0 {
 				blocked--
-				running++
 			}
+			running++
+			w.taskStatuses[evt.TaskID] = "running"
 		}
+		// "running" / unseen — ignore; out-of-order or stale event.
 	case "reclaimed":
-		// Task re-queued by Hermes for another agent — transitions back to running.
 		if evt.TaskID != "" {
 			switch prev {
 			case "blocked":
@@ -497,16 +406,13 @@ func (w *KanbanWatcher) applyEvent(evt kanbanEvent) {
 				}
 				running++
 			case "running":
-				// Already tracked as running — no counter change needed.
+				// Already tracked as running — no counter change.
 			default:
-				// Unseen task surfacing as reclaimed; count it as running.
 				running++
 			}
 			w.taskStatuses[evt.TaskID] = "running"
-		} else {
-			running++
 		}
-	case "completed", "archived", "crashed", "timed_out":
+	case "completed", "archived", "crashed", "timed_out", "gave_up":
 		if evt.TaskID != "" {
 			switch prev {
 			case "running":
@@ -519,49 +425,18 @@ func (w *KanbanWatcher) applyEvent(evt kanbanEvent) {
 				}
 			}
 			delete(w.taskStatuses, evt.TaskID)
-		} else {
-			// No task ID — best-effort decrement running.
-			if running > 0 {
-				running--
-			}
 		}
 	}
 
 	changed := w.running != running || w.blocked != blocked
 	w.running = running
 	w.blocked = blocked
-	if evt.ID > w.lastEventID {
-		w.lastEventID = evt.ID
+	if evt.ID > w.cursor {
+		w.cursor = evt.ID
 	}
 	w.mu.Unlock()
 
 	if changed {
 		w.notify()
 	}
-}
-
-// buildWSURL converts the gateway base URL to a WebSocket events endpoint.
-// Handles http://, https://, ws://, wss:// prefixes.
-func (w *KanbanWatcher) buildWSURL() string {
-	base := w.gatewayURL
-	switch {
-	case strings.HasPrefix(base, "https://"):
-		base = "wss://" + strings.TrimPrefix(base, "https://")
-	case strings.HasPrefix(base, "http://"):
-		base = "ws://" + strings.TrimPrefix(base, "http://")
-	}
-	base = strings.TrimRight(base, "/")
-	return base + "/api/plugins/kanban/events"
-}
-
-// buildHTTPURL converts the gateway base URL to an HTTP URL.
-func (w *KanbanWatcher) buildHTTPURL() string {
-	base := w.gatewayURL
-	switch {
-	case strings.HasPrefix(base, "wss://"):
-		base = "https://" + strings.TrimPrefix(base, "wss://")
-	case strings.HasPrefix(base, "ws://"):
-		base = "http://" + strings.TrimPrefix(base, "ws://")
-	}
-	return strings.TrimRight(base, "/")
 }

@@ -737,7 +737,8 @@ type storageChangedMsg struct{}
 // Only this message re-arms the next kanbanPollCmd tick.
 type kanbanCountsChangedMsg struct{}
 
-// kanbanWatcherChangedMsg is sent by the WebSocket KanbanWatcher when counts change.
+// kanbanWatcherChangedMsg is sent by the KanbanWatcher's subscription channel
+// when counts change (driven by SQLite event polling).
 // It only re-arms the watcher listener — it does NOT spawn an extra poll timer.
 type kanbanWatcherChangedMsg struct{}
 
@@ -1229,12 +1230,12 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		}
 	}
 
-	// Start Hermes Kanban badge watcher if a gateway URL is configured
-	if gatewayURL := session.GetHermesGatewayURL(); gatewayURL != "" {
-		w := session.StartKanbanWatcher(gatewayURL)
-		h.kanbanWatcher = w
-		h.kanbanWatcherCh = w.Subscribe()
-	}
+	// Start Hermes Kanban badge watcher. The watcher reads ~/.hermes/kanban.db
+	// directly and tolerates a missing file (stays unhealthy until it appears),
+	// so we can always start it — no gateway URL or dashboard process required.
+	w := session.StartKanbanWatcher()
+	h.kanbanWatcher = w
+	h.kanbanWatcherCh = w.Subscribe()
 
 	// Initialize Hermes Kanban board panel (hidden by default, toggled with 'K')
 	h.kanbanPanel = NewKanbanPanel()
@@ -4659,9 +4660,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case kanbanWatcherChangedMsg:
-		// WebSocket watcher fired — re-render and re-arm listener only.
-		// Do NOT re-arm kanbanPollCmd here; that would stack extra timers on
-		// every live badge update.
+		// SQLite watcher signalled a count change — re-render and re-arm
+		// listener only. Do NOT re-arm kanbanPollCmd here; that would stack
+		// extra timers on every badge update.
 		if h.kanbanWatcherCh != nil {
 			return h, listenForKanbanUpdates(h.kanbanWatcherCh)
 		}
