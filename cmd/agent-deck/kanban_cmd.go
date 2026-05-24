@@ -242,18 +242,28 @@ func extractKanbanProfileFlag(args []string) ([]string, string) {
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg == "-p" || arg == "--profile" {
-			if i+1 < len(args) {
+			if i+1 < len(args) && args[i+1] != "" {
 				profileVal = args[i+1]
 				i++
+			} else {
+				fmt.Fprintln(os.Stderr, "warning: --profile requires a non-empty value; flag ignored")
 			}
 			continue
 		}
 		if strings.HasPrefix(arg, "-p=") {
-			profileVal = strings.TrimPrefix(arg, "-p=")
+			if val := strings.TrimPrefix(arg, "-p="); val != "" {
+				profileVal = val
+			} else {
+				fmt.Fprintln(os.Stderr, "warning: -p= requires a non-empty value; flag ignored")
+			}
 			continue
 		}
 		if strings.HasPrefix(arg, "--profile=") {
-			profileVal = strings.TrimPrefix(arg, "--profile=")
+			if val := strings.TrimPrefix(arg, "--profile="); val != "" {
+				profileVal = val
+			} else {
+				fmt.Fprintln(os.Stderr, "warning: --profile= requires a non-empty value; flag ignored")
+			}
 			continue
 		}
 		remaining = append(remaining, arg)

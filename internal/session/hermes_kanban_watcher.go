@@ -80,10 +80,18 @@ func (w *KanbanWatcher) Start() {
 	})
 }
 
-// Stop signals the watcher to stop. Idempotent.
+// Stop signals the watcher to stop and closes all subscriber channels so
+// goroutines blocked in listenForKanbanUpdates unblock immediately. Idempotent.
 func (w *KanbanWatcher) Stop() {
 	w.stopOnce.Do(func() {
 		close(w.stopCh)
+		// Close subscriber channels so any goroutine blocked on <-ch returns.
+		w.subsMu.Lock()
+		for _, ch := range w.subs {
+			close(ch)
+		}
+		w.subs = nil
+		w.subsMu.Unlock()
 	})
 }
 
@@ -137,18 +145,6 @@ func (w *KanbanWatcher) notify() {
 		case ch <- struct{}{}:
 		default:
 		}
-	}
-}
-
-// setCountsAndNotify updates counts and notifies subscribers if changed.
-func (w *KanbanWatcher) setCountsAndNotify(running, blocked int) {
-	w.mu.Lock()
-	changed := w.running != running || w.blocked != blocked
-	w.running = running
-	w.blocked = blocked
-	w.mu.Unlock()
-	if changed {
-		w.notify()
 	}
 }
 
