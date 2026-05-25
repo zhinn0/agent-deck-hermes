@@ -86,8 +86,8 @@ var kanbanLog = logging.ForComponent("hermes-kanban")
 //     `tasks` table inside pollLoop. Bounds any drift the event stream
 //     might accumulate.
 //   - kanbanCacheTTL (15s): freshness window for the CLI fallback cache,
-//     active only when sqliteHealthy is false. Mirrors the UI-layer poll
-//     ticker (ui.kanbanPollInterval, also 15s); when the fallback is in
+//     active only when sqliteHealthy is false. Mirrors the UI-layer fallback
+//     ticker (ui.kanbanCLITickInterval, also 15s); when the fallback is in
 //     use both fire together.
 const (
 	kanbanDBPollInterval = 500 * time.Millisecond
@@ -528,7 +528,7 @@ func (w *KanbanWatcher) applyEvent(evt kanbanEvent) {
 // the TTL and the in-flight guard that maybeRefreshCache uses. The refresh
 // runs in-line on the caller's goroutine. Callers are responsible for not
 // stampeding — in practice this is invoked from a single Bubble Tea Cmd at
-// kanbanPollInterval, so concurrent invocations don't occur in normal use.
+// kanbanCLITickInterval, so concurrent invocations don't occur in normal use.
 func (w *KanbanWatcher) ForceRefreshCache() {
 	w.refreshCacheFromCLI()
 }

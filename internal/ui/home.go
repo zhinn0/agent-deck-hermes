@@ -743,19 +743,25 @@ type kanbanCountsChangedMsg struct{}
 // It only re-arms the watcher listener — it does NOT spawn an extra poll timer.
 type kanbanWatcherChangedMsg struct{}
 
-// kanbanPollInterval is how often agent-deck's UI ticker fires. The CLI
+// kanbanCLITickInterval is how often the UI's fallback ticker fires. The CLI
 // subprocess refresh inside the tick is gated on !KanbanWatcher.IsHealthy(),
 // so when the SQLite watcher is working the tick is essentially free and
 // exists only to detect a healthy→unhealthy transition within one interval.
-const kanbanPollInterval = 15 * time.Second
+//
+// Pairs with session.kanbanCacheTTL (same 15s value, same purpose at a
+// different layer): when the watcher is unhealthy, this constant decides how
+// often the UI invokes ForceRefreshCache and kanbanCacheTTL decides how stale
+// the cache may be before maybeRefreshCache schedules its own refresh on a
+// Counts/TaskStatus read. Both fire together in fallback mode.
+const kanbanCLITickInterval = 15 * time.Second
 
-// kanbanPollCmd returns a one-shot Cmd that waits kanbanPollInterval, then
+// kanbanPollCmd returns a one-shot Cmd that waits kanbanCLITickInterval, then
 // returns kanbanCountsChangedMsg. The CLI cache refresh is only invoked when
 // the SQLite watcher is unhealthy — when healthy, the tick is essentially
 // free and exists only so that a healthy→unhealthy transition is picked up
 // within one interval.
 func kanbanPollCmd(w *session.KanbanWatcher) tea.Cmd {
-	return tea.Tick(kanbanPollInterval, func(time.Time) tea.Msg {
+	return tea.Tick(kanbanCLITickInterval, func(time.Time) tea.Msg {
 		if w != nil && !w.IsHealthy() {
 			w.ForceRefreshCache()
 		}
