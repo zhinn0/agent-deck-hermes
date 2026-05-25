@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -77,6 +78,82 @@ func TestParseTaskIDFromJSON(t *testing.T) {
 			name:   "no id field",
 			input:  `{"title":"no id here"}`,
 			expect: "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseTaskIDFromJSON([]byte(tc.input))
+			if got != tc.expect {
+				t.Errorf("parseTaskIDFromJSON(%q) = %q, want %q", tc.input, got, tc.expect)
+			}
+		})
+	}
+}
+
+// TestParseTaskIDFromJSON_Validation verifies that parseTaskIDFromJSON rejects
+// task IDs containing unsafe characters (shell metachars, newlines), empty
+// strings, and overly long values. This prevents a malicious or malfunctioning
+// hermes binary from smuggling shell injection payloads into downstream
+// consumers (env vars, log lines, attach-recovery breadcrumbs).
+func TestParseTaskIDFromJSON_Validation(t *testing.T) {
+	// Build a 129-character string (one over the limit).
+	long := strings.Repeat("a", 129)
+
+	cases := []struct {
+		name   string
+		input  string
+		expect string
+	}{
+		{
+			name:   "valid alphanumeric with dash",
+			input:  `{"id":"TASK-42"}`,
+			expect: "TASK-42",
+		},
+		{
+			name:   "empty string",
+			input:  `{"id":""}`,
+			expect: "",
+		},
+		{
+			name:   "contains newline",
+			input:  `{"id":"TASK\n42"}`,
+			expect: "",
+		},
+		{
+			name:   "contains dollar sign",
+			input:  `{"id":"TASK$42"}`,
+			expect: "",
+		},
+		{
+			name:   "contains backtick",
+			input:  "{\"id\":\"TASK`42\"}",
+			expect: "",
+		},
+		{
+			name:   "contains semicolon",
+			input:  `{"id":"TASK;42"}`,
+			expect: "",
+		},
+		{
+			name:   "contains single quote",
+			input:  `{"id":"TASK'42"}`,
+			expect: "",
+		},
+		{
+			name:   "contains double quote (escaped)",
+			input:  `{"id":"TASK\"42"}`,
+			expect: "",
+		},
+		{
+			name:   "129 chars too long",
+			input:  fmt.Sprintf(`{"id":%q}`, long),
+			expect: "",
+		},
+		{
+			name:   "dots and underscores only",
+			input:  `{"id":"task._foo_.bar"}`,
+			expect: "task._foo_.bar",
 		},
 	}
 

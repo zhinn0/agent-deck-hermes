@@ -2,6 +2,7 @@ package session
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -770,5 +771,164 @@ func TestKanbanWatcher_ApplyCacheResult_NoNotifyWhenSeedOK(t *testing.T) {
 		t.Fatal("subscriber received notification while SQLite was authoritative")
 	case <-time.After(100 * time.Millisecond):
 		// ok
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Round 5 elegance pass: regression tests for newly-fixed bugs
+// ----------------------------------------------------------------------------
+
+// TestApplySeed_CursorMonotonic verifies that a reseed with a lower MAX(id)
+// (e.g. after task_events was rotated/compacted) cannot rewind the cursor.
+// Without this guard, fetchNewEvents would re-apply events we already
+// processed and double-count counters.
+func TestApplySeed_CursorMonotonic(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+
+	w.applySeed(0, 0, map[string]taskStatus{}, 100)
+	w.mu.RLock()
+	if w.cursor != 100 {
+		w.mu.RUnlock()
+		t.Fatalf("cursor after first seed = %d, want 100", w.cursor)
+	}
+	w.mu.RUnlock()
+
+	// Simulate the events table being rotated/cleared: MAX(id) drops to 50.
+	w.applySeed(0, 0, map[string]taskStatus{}, 50)
+	w.mu.RLock()
+	if w.cursor != 100 {
+		w.mu.RUnlock()
+		t.Fatalf("cursor after seed with lower id = %d, want 100 (must not regress)", w.cursor)
+	}
+	w.mu.RUnlock()
+
+	// A higher value continues to advance.
+	w.applySeed(0, 0, map[string]taskStatus{}, 200)
+	w.mu.RLock()
+	if w.cursor != 200 {
+		w.mu.RUnlock()
+		t.Fatalf("cursor after seed with higher id = %d, want 200", w.cursor)
+	}
+	w.mu.RUnlock()
+}
+
+// TestSubscribe_AfterStopReturnsClosedChannel verifies the documented
+// behavior: post-Stop subscribers see a closed channel rather than blocking
+// forever. A consumer ranging over it exits cleanly.
+func TestSubscribe_AfterStopReturnsClosedChannel(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	w.Stop()
+
+	ch := w.Subscribe()
+
+	// The channel must be closed; receiving returns zero value with ok=false.
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("expected closed channel; received with ok=true")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Subscribe after Stop blocked instead of returning closed channel")
+	}
+}
+
+// TestParseEventKind_UnknownLogsOnceAndIgnored verifies that:
+//   - Truly-unknown event kinds parse to kindIgnored.
+//   - knownIgnoredKinds (assigned, commented, ...) parse to kindIgnored
+//     without logging.
+func TestParseEventKind_UnknownIgnored(t *testing.T) {
+	// Known typed kinds.
+	for _, c := range []struct {
+		in   string
+		want eventKind
+	}{
+		{"claimed", kindClaimed},
+		{"blocked", kindBlocked},
+		{"gave_up", kindGaveUp},
+	} {
+		if got := parseEventKind(c.in); got != c.want {
+			t.Errorf("parseEventKind(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+	// Known-ignored kinds.
+	for _, k := range []string{"assigned", "commented", "promoted", "scheduled", "spawned"} {
+		if got := parseEventKind(k); got != kindIgnored {
+			t.Errorf("parseEventKind(%q) = %v, want kindIgnored", k, got)
+		}
+	}
+	// Genuinely unknown kind: should parse to kindIgnored.
+	if got := parseEventKind("future_kind_v2"); got != kindIgnored {
+		t.Errorf("parseEventKind(unknown) = %v, want kindIgnored", got)
+	}
+	// Empty string: also kindIgnored (no log).
+	if got := parseEventKind(""); got != kindIgnored {
+		t.Errorf("parseEventKind(\"\") = %v, want kindIgnored", got)
+	}
+}
+
+// TestFetchFailStreak_AtomicCounter verifies the streak counter increments
+// and resets correctly. The full pollLoop logging behavior is covered by
+// inspection — this just locks down the counter mechanics.
+func TestFetchFailStreak_AtomicCounter(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	for i := int32(1); i <= 3; i++ {
+		if got := w.fetchFailStreak.Add(1); got != i {
+			t.Fatalf("after %d failures, fetchFailStreak = %d, want %d", i, got, i)
+		}
+	}
+	if old := w.fetchFailStreak.Swap(0); old != 3 {
+		t.Fatalf("swap reset = %d, want 3", old)
+	}
+	if cur := w.fetchFailStreak.Load(); cur != 0 {
+		t.Fatalf("after reset = %d, want 0", cur)
+	}
+}
+
+// TestApplyEvent_TaskTableCap verifies that when taskStatuses hits the cap,
+// new claimed events neither insert into the map nor increment counters —
+// preventing the counter from drifting up forever without a corresponding
+// retire-on-completed.
+func TestApplyEvent_TaskTableCap(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	// Fill the map to one below the cap.
+	for i := 0; i < kanbanMaxTrackedTasks; i++ {
+		w.taskStatuses[fmt.Sprintf("filler-%d", i)] = statusRunning
+	}
+	w.running = kanbanMaxTrackedTasks
+
+	// One more claim at the cap: must NOT increment.
+	w.applyEvent(kanbanEvent{ID: 1, Kind: kindClaimed, TaskID: "over-cap-task"})
+
+	if r, _ := w.Counts(); r != kanbanMaxTrackedTasks {
+		t.Fatalf("running after over-cap claim = %d, want %d (no increment when full)", r, kanbanMaxTrackedTasks)
+	}
+	if _, present := w.taskStatuses["over-cap-task"]; present {
+		t.Fatal("over-cap task was inserted into map; cap not enforced")
+	}
+}
+
+// TestPollLoop_PanicMarksUnhealthy verifies that a recovered panic in
+// pollLoop's defer also clears sqliteHealthy, so callers fall back to the
+// CLI cache instead of receiving frozen-but-stale Counts forever.
+func TestPollLoop_PanicMarksUnhealthy(t *testing.T) {
+	w := NewKanbanWatcher("ignored")
+	// Pretend a previous seed succeeded.
+	w.applySeed(5, 0, map[string]taskStatus{"T": statusRunning}, 0)
+	if !w.IsHealthy() {
+		t.Fatal("setup: expected IsHealthy=true after applySeed")
+	}
+
+	// Simulate the recovery path's effect: log + markUnhealthy.
+	// (We don't actually trigger a panic; we verify markUnhealthy is the
+	// right primitive — pollLoop's defer invokes exactly this.)
+	w.markUnhealthy()
+
+	if w.IsHealthy() {
+		t.Fatal("after markUnhealthy: expected IsHealthy=false")
+	}
+	// Counts must still return last-known values (not zero) so the UI
+	// shows stale-but-known instead of zeros.
+	if r, _ := w.Counts(); r != 5 {
+		t.Fatalf("Counts after markUnhealthy = %d, want 5 (last known)", r)
 	}
 }

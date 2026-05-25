@@ -7,10 +7,16 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
+
+// validTaskIDPattern restricts task IDs to a safe character set so that values
+// parsed from hermes JSON cannot smuggle shell metacharacters, newlines, or
+// other surprises into downstream contexts (env vars, log lines, file paths).
+var validTaskIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
 
 // handleKanban is the top-level dispatcher for `agent-deck kanban <verb> …`.
 // Most subcommands delegate directly to `hermes kanban <verb> …`, streaming
@@ -172,19 +178,33 @@ func handleKanbanCreate(args []string) {
 	// Run hermes kanban create with --json so we can parse the task ID.
 	hermesArgs := append([]string{"kanban", "create", "--json"}, remaining...)
 	cmd := exec.Command("hermes", hermesArgs...) //nolint:gosec
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: hermes kanban create failed: %v\n", err)
+		os.Exit(1)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: hermes kanban create failed: %v\n", err)
+		os.Exit(1)
+	}
+	// Cap stdout at 1 MiB — Hermes's `kanban create --json` response should be a
+	// few hundred bytes; anything beyond 1 MiB is a malfunction or attack.
+	out, readErr := io.ReadAll(io.LimitReader(stdout, 1<<20))
+	if err := cmd.Wait(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: hermes kanban create failed: %v\n", err)
+		os.Exit(1)
+	}
+	if readErr != nil {
+		fmt.Fprintf(os.Stderr, "Error: hermes kanban create failed: %v\n", readErr)
 		os.Exit(1)
 	}
 
 	// Print JSON output so the user sees it.
-	fmt.Print(out.String())
+	fmt.Print(string(out))
 
 	// Parse task ID from JSON output.
-	taskID := parseTaskIDFromJSON(out.Bytes())
+	taskID := parseTaskIDFromJSON(out)
 	if taskID == "" {
 		fmt.Fprintf(os.Stderr, "Error: --session %q was requested but auto-attach failed: could not extract task ID from hermes response.\n", *session)
 		fmt.Fprintf(os.Stderr, "       The task may have been created; re-run `agent-deck kanban attach %s <task-id>` manually once you have the task ID.\n", *session)
@@ -234,6 +254,12 @@ func attachSession(sessionID, taskID string) {
 		os.Exit(2)
 	}
 
+	// Breadcrumb before mutation: if the user hits Ctrl-C between the in-memory
+	// mutation below and the SaveWithGroups call, the task exists in Hermes but
+	// agent-deck has no link to it. Print the manual-recovery command up front
+	// so the user can copy-paste it if interrupted.
+	fmt.Fprintf(os.Stderr, "Linking session %s ↔ task %s (interrupting now will require manual re-attach: agent-deck kanban attach %s %s)...\n", sessionID, taskID, sessionID, taskID)
+
 	inst.KanbanTaskID = taskID
 
 	groupTree := session.NewGroupTreeWithGroups(instances, groups)
@@ -270,6 +296,9 @@ func parseTaskIDFromJSON(data []byte) string {
 	for _, key := range []string{"id", "task_id", "taskId", "task-id"} {
 		if v, ok := result[key]; ok {
 			if s, ok := v.(string); ok && s != "" {
+				if !validTaskIDPattern.MatchString(s) {
+					return ""
+				}
 				return s
 			}
 		}

@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -80,6 +82,18 @@ type KanbanWatcher struct {
 	// streak"; reset on the next successful refresh in refreshCacheFromCLI.
 	cliRefreshFailed         atomic.Bool // any-exec-failure streak active
 	cliBinaryMissingLogged   atomic.Bool // "hermes not in PATH" logged once
+	cliUnmarshalFailed       atomic.Bool // JSON unmarshal failure streak active
+	cliPayloadTooLarge       atomic.Bool // CLI stdout exceeded kanbanCLIOutputCap streak active
+
+	// fetchFailStreak counts consecutive fetchNewEvents failures. When it
+	// crosses kanbanFetchFailStreakWarn we emit a single Warn log; reset
+	// to 0 on the next successful fetch (and that reset emits an Info if
+	// the streak was ≥ the warn threshold).
+	fetchFailStreak atomic.Int32
+
+	// taskTableFullLogged is true after we've logged the "taskStatuses cap
+	// reached" Warn once. Reset by the next successful seed (in applySeed).
+	taskTableFullLogged atomic.Bool
 }
 
 var kanbanLog = logging.ForComponent("hermes-kanban")
@@ -100,6 +114,27 @@ const (
 	kanbanDBPollInterval = 500 * time.Millisecond
 	kanbanReseedInterval = 5 * time.Minute
 	kanbanCacheTTL       = 15 * time.Second
+
+	// kanbanFetchFailStreakWarn is how many consecutive fetchNewEvents
+	// failures trigger a Warn log. The fetch-only-broken case (seed healthy
+	// but events table corrupt) would otherwise stay at Debug forever and
+	// no operator would notice. 10 × 500ms ≈ 5 seconds of consistent
+	// failure before we escalate.
+	kanbanFetchFailStreakWarn = 10
+
+	// kanbanMaxTrackedTasks caps the in-memory taskStatuses map at this
+	// many entries. A misbehaving (or compromised) Hermes that streams
+	// claimed events for unique task IDs forever would otherwise grow the
+	// map without bound; cap + Debug log once + skip-on-overflow gives a
+	// defense-in-depth bound. The 5-minute reseed reclaims memory in any
+	// realistic scenario, so this cap should never be hit by legitimate
+	// workloads.
+	kanbanMaxTrackedTasks = 10_000
+
+	// kanbanCLIOutputCap bounds the bytes accepted from `hermes kanban
+	// list --json`. The legitimate response for a board of any plausible
+	// size is well under 1 MiB; anything larger is malfunction or attack.
+	kanbanCLIOutputCap = 1 << 20
 )
 
 // taskStatus is the in-memory representation of a task's lifecycle position
@@ -197,9 +232,31 @@ func (k eventKind) String() string {
 	}
 }
 
+// knownIgnoredKinds are kinds Hermes legitimately emits that don't change
+// running/blocked counts (assignments, comments, scheduling). Listed
+// explicitly so parseEventKind can distinguish them from genuinely UNKNOWN
+// kinds (a future Hermes addition we don't know about yet) — the latter
+// get a Debug log line so operators have a breadcrumb.
+var knownIgnoredKinds = map[string]struct{}{
+	"assigned":  {},
+	"commented": {},
+	"promoted":  {},
+	"scheduled": {},
+	"spawned":   {},
+}
+
+// unknownKindLogged is a per-distinct-kind log-once set. Avoids spamming
+// Debug for the same unknown kind on every poll. Lives at package scope
+// because it's process-wide (the watcher may be restarted but the runtime
+// hasn't lost what kinds it's seen).
+var unknownKindLogged sync.Map
+
 // parseEventKind maps a `task_events.kind` column value to an eventKind.
 // Returns kindIgnored for any kind we don't handle — these become no-ops in
-// applyEvent rather than triggering a missing-case bug.
+// applyEvent rather than triggering a missing-case bug. UNKNOWN kinds
+// (neither typed nor in knownIgnoredKinds) are logged at Debug, rate-limited
+// to one entry per distinct string, so a future Hermes addition is visible
+// to operators without log spam.
 func parseEventKind(s string) eventKind {
 	switch s {
 	case "claimed":
@@ -220,9 +277,15 @@ func parseEventKind(s string) eventKind {
 		return kindTimedOut
 	case "gave_up":
 		return kindGaveUp
-	default:
-		return kindIgnored
 	}
+	// Not a known kind. Don't spam logs for legitimately-ignored ones; only
+	// log truly-unknown values that may indicate Hermes schema evolution.
+	if _, known := knownIgnoredKinds[s]; !known && s != "" {
+		if _, alreadyLogged := unknownKindLogged.LoadOrStore(s, struct{}{}); !alreadyLogged {
+			kanbanLog.Debug("kanban_unknown_event_kind", slog.String("kind", s))
+		}
+	}
+	return kindIgnored
 }
 
 // kanbanEvent mirrors the relevant columns of the task_events row, post-
@@ -239,6 +302,17 @@ type kanbanEvent struct {
 // is not required to exist (the KanbanWatcher tolerates a missing file).
 func HermesKanbanDBPath() string {
 	return filepath.Join(GetHermesConfigDir(), "kanban.db")
+}
+
+// loggablePath returns a path with the user's home directory replaced by ~.
+// Used in log lines so log aggregators don't capture the username embedded
+// in /Users/<user>/.hermes/kanban.db or /home/<user>/.hermes/kanban.db.
+func loggablePath(p string) string {
+	home, err := os.UserHomeDir()
+	if err == nil && home != "" && strings.HasPrefix(p, home) {
+		return "~" + p[len(home):]
+	}
+	return p
 }
 
 // NewKanbanWatcher constructs a watcher rooted at the given SQLite file.
@@ -339,11 +413,23 @@ func (w *KanbanWatcher) IsHealthy() bool {
 // Lifecycle: each call returns a NEW channel. Stop() closes every subscriber
 // channel, so a consumer ranging over the returned channel will exit cleanly
 // when Stop is called. A caller that drops the returned channel without
-// calling Unsubscribe leaks the channel until Stop. After Stop, subsequent
-// Subscribe calls return channels that will never receive nor close.
+// calling Unsubscribe leaks the channel until Stop. After Stop has been
+// called, Subscribe returns a pre-closed channel — callers ranging over it
+// see the zero-value once and exit, instead of blocking forever.
 func (w *KanbanWatcher) Subscribe() <-chan struct{} {
 	ch := make(chan struct{}, 1)
 	w.subsMu.Lock()
+	// stopCh and subs are both written under subsMu in Stop(), so checking
+	// stopCh here gives us a clean post-Stop signal. If Stop has fired we
+	// return a pre-closed channel rather than appending to the now-cleared
+	// subs slice (which would leak the channel until process exit).
+	select {
+	case <-w.stopCh:
+		w.subsMu.Unlock()
+		close(ch)
+		return ch
+	default:
+	}
 	w.subs = append(w.subs, ch)
 	w.subsMu.Unlock()
 	return ch
@@ -393,16 +479,25 @@ func (w *KanbanWatcher) notify() {
 // to bound any drift the state machine might accumulate.
 //
 // A panic inside this goroutine would silently freeze badges forever (no more
-// notifications would ever fire). The defer-recover ensures the operator at
-// least sees an Error log if it happens; the loop will then exit, but a
-// dead-but-loud watcher is strictly better than a dead-and-silent one.
+// notifications would ever fire). The defer-recover logs an Error AND clears
+// sqliteHealthy so Counts/TaskStatus fall back to the CLI cache — a degraded
+// (15s polling) experience instead of a frozen one. The loop still exits
+// because Go can't safely resume after a recovered panic that may have left
+// internal state inconsistent; the user must restart agent-deck to recover
+// sub-second updates. The fallback is the safety net for the window in
+// between.
 func (w *KanbanWatcher) pollLoop() {
 	defer func() {
 		if r := recover(); r != nil {
 			kanbanLog.Error("kanban_pollloop_panic",
 				slog.Any("panic", r),
-				slog.String("db_path", w.dbPath),
+				slog.String("db_path", loggablePath(w.dbPath)),
+				slog.String("hint", "restart agent-deck to resume real-time updates; CLI fallback now active"),
 			)
+			// Best-effort markUnhealthy — protect against a secondary panic
+			// in case w.mu itself is in an inconsistent state.
+			defer func() { _ = recover() }()
+			w.markUnhealthy()
 		}
 	}()
 
@@ -421,7 +516,7 @@ func (w *KanbanWatcher) pollLoop() {
 				w.markUnhealthy()
 				kanbanLog.Debug("kanban_db_seed_failed",
 					slog.String("error", err.Error()),
-					slog.String("db_path", w.dbPath),
+					slog.String("db_path", loggablePath(w.dbPath)),
 				)
 				// Wait before retry; back off a little but stay responsive.
 				select {
@@ -444,14 +539,35 @@ func (w *KanbanWatcher) pollLoop() {
 			}
 		}
 
-		// Poll for new events.
+		// Poll for new events. Track consecutive failures so a persistently
+		// broken events path (e.g. task_events table corrupted while tasks
+		// remains seedable) escalates from Debug to Warn after a brief
+		// streak — without this the only signal would be invisible Debug
+		// lines until the 5-minute reseed.
 		if err := w.fetchNewEvents(); err != nil {
-			kanbanLog.Debug("kanban_db_poll_failed",
-				slog.String("error", err.Error()),
-				slog.String("db_path", w.dbPath),
-			)
+			streak := w.fetchFailStreak.Add(1)
+			if streak == kanbanFetchFailStreakWarn {
+				kanbanLog.Warn("kanban_db_poll_failing_persistently",
+					slog.String("error", err.Error()),
+					slog.String("db_path", loggablePath(w.dbPath)),
+					slog.Int("consecutive_failures", int(streak)),
+				)
+			} else {
+				kanbanLog.Debug("kanban_db_poll_failed",
+					slog.String("error", err.Error()),
+					slog.String("db_path", loggablePath(w.dbPath)),
+				)
+			}
 			// Don't mark unhealthy on a transient poll error — the next seed
 			// will either succeed (resync) or fail loudly.
+		} else {
+			// Reset streak on success; if we'd previously escalated to Warn,
+			// emit an Info recovery signal that pairs with the warn line.
+			if old := w.fetchFailStreak.Swap(0); old >= kanbanFetchFailStreakWarn {
+				kanbanLog.Info("kanban_db_poll_recovered",
+					slog.String("db_path", loggablePath(w.dbPath)),
+				)
+			}
 		}
 
 		select {
@@ -462,13 +578,18 @@ func (w *KanbanWatcher) pollLoop() {
 	}
 }
 
-// openDB opens the SQLite file read-only with a short busy timeout. WAL mode
-// is set on the file by whoever writes to it (Hermes); opening read-only does
-// not require us to set it. The query string keeps the connection lightweight.
+// openDB opens the SQLite file read-only with a short busy timeout.
+//
+// WAL mode notes: in steady state Hermes opens kanban.db with journal_mode=WAL
+// before any write, and the mode is recorded in the file header — our read-only
+// opens then ride alongside concurrent writes without contention. At fresh
+// install before Hermes has written, the file may be in DELETE mode; mode=ro
+// still works but a contended write may block our SHARED-lock acquisition for
+// up to busy_timeout. The 2-second timeout absorbs the common case; the 3s
+// per-query context further bounds it. sql.Open is lazy and does not touch the
+// file — the first QueryContext is what actually opens it, so we don't os.Stat
+// first; SQLITE_CANTOPEN surfaces naturally on the query.
 func (w *KanbanWatcher) openDB() (*sql.DB, error) {
-	if _, err := os.Stat(w.dbPath); err != nil {
-		return nil, fmt.Errorf("kanban.db not present: %w", err)
-	}
 	// mode=ro: read-only open; doesn't create the file.
 	// _pragma=busy_timeout: wait briefly if the writer is mid-transaction.
 	dsn := "file:" + w.dbPath + "?mode=ro&_pragma=busy_timeout(2000)"
@@ -481,6 +602,15 @@ func (w *KanbanWatcher) openDB() (*sql.DB, error) {
 
 // seed reads the current task snapshot and the high-water-mark from
 // task_events.id, replacing in-memory state in one atomic update.
+//
+// Query order matters for correctness under a concurrent writer. We read
+// task_events.MAX(id) FIRST, then the tasks snapshot. If Hermes claims a task
+// between the two reads, the claim event has id > our cursor — fetchNewEvents
+// will pick it up on the next tick and reconcile, applying claimed and
+// double-counting is prevented by the per-task status check in applyEvent
+// (prev != statusUnknown means no increment). Reversing this order (tasks
+// first, then MAX(id)) would let an in-flight claim's event id end up <=
+// cursor and never be replayed, hiding the task indefinitely.
 func (w *KanbanWatcher) seed() error {
 	db, err := w.openDB()
 	if err != nil {
@@ -491,6 +621,15 @@ func (w *KanbanWatcher) seed() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
+	// 1) Cursor first (high-water-mark of events at seed time).
+	var cursor int64
+	if err := db.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(id), 0) FROM task_events`).Scan(&cursor); err != nil {
+		return fmt.Errorf("query high-water mark: %w", err)
+	}
+
+	// 2) Then tasks (may include rows whose claim event was after `cursor`;
+	//    fetchNewEvents will reconcile via applyEvent's prev-status guard).
 	statuses := make(map[string]taskStatus)
 	var running, blocked int
 
@@ -523,12 +662,6 @@ func (w *KanbanWatcher) seed() error {
 	}
 	rows.Close()
 
-	var cursor int64
-	if err := db.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(id), 0) FROM task_events`).Scan(&cursor); err != nil {
-		return fmt.Errorf("query high-water mark: %w", err)
-	}
-
 	w.applySeed(running, blocked, statuses, cursor)
 	return nil
 }
@@ -544,12 +677,23 @@ func (w *KanbanWatcher) applySeed(running, blocked int, statuses map[string]task
 	w.running = running
 	w.blocked = blocked
 	w.taskStatuses = statuses
-	w.cursor = cursor
+	// Cursor must never decrease. If the SQLite event log was rotated /
+	// compacted / fresh-installed underneath us, MAX(id) can drop below our
+	// previous cursor; taking max() keeps in-flight applyEvent dedup correct
+	// (we won't re-apply events that are no longer there) and prevents the
+	// re-application loop the user-visible counts depend on.
+	if cursor > w.cursor {
+		w.cursor = cursor
+	}
 	w.sqliteHealthy = true
 	w.mu.Unlock()
+	// Reset the table-full streak flag: the new taskStatuses map starts
+	// fresh, so the cap can re-trigger if events come in faster than we
+	// can clear them again.
+	w.taskTableFullLogged.Store(false)
 	if recovered {
 		kanbanLog.Info("kanban_sqlite_recovered",
-			slog.String("db_path", w.dbPath),
+			slog.String("db_path", loggablePath(w.dbPath)),
 			slog.Int("running", running),
 			slog.Int("blocked", blocked),
 		)
@@ -571,7 +715,7 @@ func (w *KanbanWatcher) markUnhealthy() {
 	w.mu.Unlock()
 	if degraded {
 		kanbanLog.Warn("kanban_sqlite_degraded",
-			slog.String("db_path", w.dbPath),
+			slog.String("db_path", loggablePath(w.dbPath)),
 		)
 	}
 }
@@ -633,11 +777,31 @@ func (w *KanbanWatcher) applyEvent(evt kanbanEvent) {
 	blocked := w.blocked
 	prev := w.taskStatuses[evt.TaskID]
 
+	// trackNewTask inserts a previously-unseen task into the status map,
+	// respecting the kanbanMaxTrackedTasks cap. Returns true on insert,
+	// false if the cap was hit — caller must NOT increment counters when
+	// false, because we have no way to retire the task later if we never
+	// tracked it. The 5-minute reseed resets the map and the streak flag.
+	trackNewTask := func(id string, s taskStatus) bool {
+		if len(w.taskStatuses) >= kanbanMaxTrackedTasks {
+			if !w.taskTableFullLogged.Swap(true) {
+				kanbanLog.Warn("kanban_task_table_full",
+					slog.Int("cap", kanbanMaxTrackedTasks),
+					slog.String("hint", "watcher will reseed in <5min to reclaim memory"),
+				)
+			}
+			return false
+		}
+		w.taskStatuses[id] = s
+		return true
+	}
+
 	switch evt.Kind {
 	case kindClaimed:
 		if prev == statusUnknown && evt.TaskID != "" {
-			running++
-			w.taskStatuses[evt.TaskID] = statusRunning
+			if trackNewTask(evt.TaskID, statusRunning) {
+				running++
+			}
 		}
 	case kindBlocked:
 		if evt.TaskID != "" {
@@ -647,12 +811,15 @@ func (w *KanbanWatcher) applyEvent(evt kanbanEvent) {
 					running--
 				}
 				blocked++
+				w.taskStatuses[evt.TaskID] = statusBlocked
 			case statusBlocked:
 				// Already blocked — no-op.
 			default:
-				blocked++
+				// New task seen first as blocked.
+				if trackNewTask(evt.TaskID, statusBlocked) {
+					blocked++
+				}
 			}
-			w.taskStatuses[evt.TaskID] = statusBlocked
 		}
 	case kindUnblocked:
 		if evt.TaskID != "" && prev == statusBlocked {
@@ -671,12 +838,15 @@ func (w *KanbanWatcher) applyEvent(evt kanbanEvent) {
 					blocked--
 				}
 				running++
+				w.taskStatuses[evt.TaskID] = statusRunning
 			case statusRunning:
 				// Already tracked as running — no counter change.
 			default:
-				running++
+				// New task seen first as reclaimed (unusual but possible).
+				if trackNewTask(evt.TaskID, statusRunning) {
+					running++
+				}
 			}
-			w.taskStatuses[evt.TaskID] = statusRunning
 		}
 	case kindCompleted, kindArchived, kindCrashed, kindTimedOut, kindGaveUp:
 		if evt.TaskID != "" {
@@ -754,42 +924,79 @@ func (w *KanbanWatcher) maybeRefreshCache() {
 }
 
 // refreshCacheFromCLI runs `hermes kanban list --json`, parses the response,
-// and applies it via applyCacheResult. Errors are mostly silent: a failed
-// CLI call leaves the previous cached values in place and the next call
-// will retry. However:
-//   - "hermes binary not found in PATH" is logged Info ONCE per atomic flag
-//     (users who have not installed Hermes get a single startup mention,
-//     not log spam).
-//   - Other exec failures (non-zero exit, timeout, killed) are logged Warn
-//     ONCE per consecutive-failure streak, reset on the next success — so an
-//     incident produces a single Warn at onset, not one per 15-second tick.
-//   - JSON unmarshal failures are logged Warn with a payload preview; these
-//     indicate hermes CLI output drift and need investigation.
+// and applies it via applyCacheResult. Each distinct failure class is logged
+// Warn (or Info for the expected case) ONCE per failure streak, reset on the
+// next success — so an incident produces a single line per streak, not one
+// per 15-second tick. Failure classes:
+//   - "hermes binary not in PATH" → Info once (cliBinaryMissingLogged).
+//   - Other exec failures (non-zero exit, timeout, killed) → Warn once
+//     (cliRefreshFailed).
+//   - Output exceeds kanbanCLIOutputCap → Warn once (cliPayloadTooLarge); a
+//     hermes binary returning huge output is malfunction or attack.
+//   - JSON unmarshal failure → Warn once (cliUnmarshalFailed) with a 200-byte
+//     payload preview.
+//
+// All paths leave the previous cached values in place; the SQLite poll's
+// authoritative values (when sqliteHealthy) are never clobbered.
 func (w *KanbanWatcher) refreshCacheFromCLI() {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "hermes", "kanban", "list", "--json").Output()
+
+	// Use StdoutPipe + io.LimitReader to cap subprocess output. cmd.Output()
+	// would buffer unbounded; a hermes binary writing 2 GB of valid JSON
+	// would OOM us without this bound.
+	cmd := exec.CommandContext(ctx, "hermes", "kanban", "list", "--json")
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		w.logCLIRefreshError(err)
 		return
 	}
-	// On success, reset the failure-streak flags so future failures log again.
+	if err := cmd.Start(); err != nil {
+		w.logCLIRefreshError(err)
+		return
+	}
+	out, readErr := io.ReadAll(io.LimitReader(stdout, kanbanCLIOutputCap+1))
+	waitErr := cmd.Wait()
+	if waitErr != nil {
+		w.logCLIRefreshError(waitErr)
+		return
+	}
+	if readErr != nil {
+		w.logCLIRefreshError(readErr)
+		return
+	}
+	if int64(len(out)) > kanbanCLIOutputCap {
+		if !w.cliPayloadTooLarge.Swap(true) {
+			kanbanLog.Warn("kanban_cli_payload_too_large",
+				slog.Int("bytes_read", len(out)),
+				slog.Int("cap_bytes", kanbanCLIOutputCap),
+			)
+		}
+		return
+	}
+	// On success, reset all CLI-error streak flags so future failures log again.
 	w.cliRefreshFailed.Store(false)
+	w.cliPayloadTooLarge.Store(false)
 	var tasks []struct {
 		ID     string `json:"id"`
 		Status string `json:"status"`
 	}
 	if err := json.Unmarshal(out, &tasks); err != nil {
-		preview := string(out)
-		if len(preview) > 200 {
-			preview = preview[:200]
+		if !w.cliUnmarshalFailed.Swap(true) {
+			preview := string(out)
+			if len(preview) > 200 {
+				preview = preview[:200]
+			}
+			kanbanLog.Warn("kanban_cli_unmarshal_failed",
+				slog.String("error", err.Error()),
+				slog.String("payload_preview", preview),
+			)
 		}
-		kanbanLog.Warn("kanban_cli_unmarshal_failed",
-			slog.String("error", err.Error()),
-			slog.String("payload_preview", preview),
-		)
 		return
 	}
+	// Successful unmarshal — reset the unmarshal-streak flag so a future
+	// shape drift logs again.
+	w.cliUnmarshalFailed.Store(false)
 	var running, blocked int
 	statuses := make(map[string]taskStatus)
 	for _, t := range tasks {

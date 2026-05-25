@@ -107,7 +107,7 @@ func (i *Instance) buildHermesCommand(baseCommand string) string {
 	// automatically. Only injected when the DB exists to avoid polluting the
 	// env for users who haven't set up Kanban.
 	if _, err := os.Stat(HermesKanbanDBPath()); err == nil {
-		cmd = "HERMES_KANBAN_BOARD=default " + cmd
+		cmd = "HERMES_KANBAN_BOARD=" + shellQuote("default") + " " + cmd
 	}
 
 	// Inject HERMES_KANBAN_TASK when this session is linked to a specific task.
