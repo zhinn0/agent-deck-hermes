@@ -619,7 +619,7 @@ func TestKanbanWatcher_Seed_FailsWhenFileMissing(t *testing.T) {
 // poll is unhealthy, Counts/TaskStatus return values written by applyCacheResult.
 func TestKanbanWatcher_FallbackReturnsCachedCounts(t *testing.T) {
 	w := NewKanbanWatcher(filepath.Join(t.TempDir(), "no.db"))
-	// SQLite-unhealthy state (seedOK=false is the zero value).
+	// SQLite-unhealthy state (sqliteHealthy=false is the zero value).
 	w.applyCacheResult(3, 2, map[string]string{
 		"T_run":   "running",
 		"T_block": "blocked",

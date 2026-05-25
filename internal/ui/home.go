@@ -315,7 +315,8 @@ type Home struct {
 	hookWatcher        *session.StatusFileWatcher
 	pendingHooksPrompt bool // True if user should be prompted to install hooks
 
-	// Hermes Kanban badge watcher (WebSocket real-time counts)
+	// Hermes Kanban badge watcher (direct SQLite poll of ~/.hermes/kanban.db
+	// with a CLI cache fallback when the DB is missing or unreadable).
 	kanbanWatcher *session.KanbanWatcher
 	// kanbanWatcherCh is the long-lived subscription channel. Subscribed once at
 	// model init; listenForKanbanUpdates drains it forever rather than churning
@@ -742,8 +743,10 @@ type kanbanCountsChangedMsg struct{}
 // It only re-arms the watcher listener — it does NOT spawn an extra poll timer.
 type kanbanWatcherChangedMsg struct{}
 
-// kanbanPollInterval is how often agent-deck re-polls kanban CLI when the
-// WebSocket watcher is unavailable or unhealthy.
+// kanbanPollInterval is how often agent-deck's UI ticker fires. The CLI
+// subprocess refresh inside the tick is gated on !KanbanWatcher.IsHealthy(),
+// so when the SQLite watcher is working the tick is essentially free and
+// exists only to detect a healthy→unhealthy transition within one interval.
 const kanbanPollInterval = 15 * time.Second
 
 // kanbanPollCmd returns a one-shot Cmd that waits kanbanPollInterval, then
@@ -2090,8 +2093,8 @@ func (h *Home) Init() tea.Cmd {
 	}
 
 	// Start listening for Hermes Kanban badge updates.
-	// Also start a CLI poll ticker so badges render even when the WebSocket
-	// watcher is unavailable (e.g. gateway running without kanban WS endpoints).
+	// Also start a CLI poll ticker so badges render even when the SQLite
+	// watcher is unhealthy (e.g. kanban.db missing — user hasn't set up Kanban).
 	if h.kanbanWatcherCh != nil {
 		cmds = append(cmds, listenForKanbanUpdates(h.kanbanWatcherCh))
 	}
@@ -4674,7 +4677,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case kanbanCountsChangedMsg:
 		// CLI poll tick fired. Re-arm unconditionally so we keep ticking even
 		// when the watcher is healthy — the subprocess call inside kanbanPollCmd
-		// is gated on !IsHealthy(), so this is essentially free when the WS
+		// is gated on !IsHealthy(), so this is essentially free when the SQLite
 		// watcher is working and self-recovers within one interval if it isn't.
 		return h, kanbanPollCmd(h.kanbanWatcher)
 

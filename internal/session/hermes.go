@@ -106,8 +106,7 @@ func (i *Instance) buildHermesCommand(baseCommand string) string {
 	// Inject HERMES_KANBAN_BOARD so the spawned session gets kanban_* tools
 	// automatically. Only injected when the DB exists to avoid polluting the
 	// env for users who haven't set up Kanban.
-	kanbanDB := filepath.Join(GetHermesConfigDir(), "kanban.db")
-	if _, err := os.Stat(kanbanDB); err == nil {
+	if _, err := os.Stat(HermesKanbanDBPath()); err == nil {
 		cmd = "HERMES_KANBAN_BOARD=default " + cmd
 	}
 
@@ -146,13 +145,6 @@ func HermesSharedWorkspaceDir() string {
 		return config.Hermes.WorkspaceDir
 	}
 	return filepath.Join(os.TempDir(), "hermes-workspaces")
-}
-
-// HermesKanbanDBPath returns the standard path to Hermes's kanban.db.
-// The path is computed deterministically from GetHermesConfigDir; the file
-// is not required to exist (the KanbanWatcher tolerates a missing file).
-func HermesKanbanDBPath() string {
-	return filepath.Join(GetHermesConfigDir(), "kanban.db")
 }
 
 // hermesDefaultGatewayPort is the port hermes gateway always listens on.
